@@ -764,7 +764,7 @@ fn cmd_test(preset: &str) {
     for name in build_chain(preset) {
         out(&format!("--> 方式 {:<8} {}\n", name, preset_desc(&name)));
         out("    正在发送一次 Ctrl+Win+Right，请观察桌面是否切换 ...\n");
-        let (raw, ext, gap, split) = preset_params(name);
+        let (raw, ext, gap, split) = preset_params(&name);
         let ok = send_with(VK_RIGHT, raw, ext, gap, split);
         out(&format!(
             "    结果：{}\n",
