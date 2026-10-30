@@ -1,18 +1,16 @@
-# 把链接子系统设为 Windows（/SUBSYSTEM:WINDOWS）：运行时没有控制台窗口，
-# 进程也不会因为启动它的控制台被关闭而随之被杀 —— 等价于 Python 版用 pythonw
-# 后台化的效果。常驻运行时完全无窗口、静默；需要看输出时用 --test / --stop
-# 从 cmd/终端启动，程序会 AttachConsole 到父控制台再打印。
+# 本文件刻意保持为空配置。
 #
-# 覆盖 MSVC 与 GNU 两种工具链。若只装了一种，无关条目会被忽略。
-
-[target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "link-args=/SUBSYSTEM:WINDOWS"]
-
-[target.i686-pc-windows-msvc]
-rustflags = ["-C", "link-args=/SUBSYSTEM:WINDOWS"]
-
-[target.x86_64-pc-windows-gnu]
-rustflags = ["-C", "link-args=-Wl,--subsystem,windows"]
-
-[target.i686-pc-windows-gnu]
-rustflags = ["-C", "link-args=-Wl,--subsystem,windows"]
+# 曾经在这里用 rustflags 全局设置子系统：
+#     [target.x86_64-pc-windows-msvc]
+#     rustflags = ["-C", "link-args=/SUBSYSTEM:WINDOWS"]
+#
+# 这是错的：rustflags 会作用于**所有**被编译的 crate，包括依赖的 build script。
+# windows_x86_64_msvc 的构建脚本是控制台程序（入口 main），被强制要求 WinMain
+# 入口后链接失败：
+#     msvcrt.lib(exe_winmain.obj) : error LNK2019: unresolved external symbol WinMain
+#     fatal error LNK1120: 1 unresolved externals
+#
+# 正确做法是在 src/main.rs 顶部用 crate 级属性（只作用于最终二进制）：
+#     #![windows_subsystem = "windows"]
+#
+# 这里不再放任何 rustflags，以免再次误伤 build script。

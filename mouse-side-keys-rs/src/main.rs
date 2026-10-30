@@ -29,6 +29,18 @@
 //!   mouse_side_keys_rs.exe --stop          停止正在运行的实例
 //!   mouse_side_keys_rs.exe --elevate       通过 UAC 以管理员身份重启（解决 UIPI 拦截）
 
+// 子系统设为 Windows（等价于链接器 /SUBSYSTEM:WINDOWS）：
+// 运行时无控制台窗口，也不会因为启动它的控制台被关闭而被连带杀掉 ——
+// 对应 Python 版用 pythonw 后台化的效果。需要看输出时从 cmd/终端启动，
+// 程序会 AttachConsole 到父控制台再打印（--test / --stop）。
+//
+// 重要：必须用 crate 级属性，不能改用 .cargo/config.toml 里的
+// `-C link-args=/SUBSYSTEM:WINDOWS`。后者是全局 rustflags，会连带作用于依赖的
+// build script；构建脚本本身是控制台程序（入口 main），被强制要求 WinMain 入口
+// 后会在链接期报 `LNK2019: unresolved external symbol WinMain` 而导致整个编译失败。
+// crate 级属性只作用于最终二进制，不影响 build script。
+#![windows_subsystem = "windows"]
+
 use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};

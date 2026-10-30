@@ -47,6 +47,8 @@ jobs:
       - name: Publish log and exe to build-output branch
         if: always()
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name "actions-bot"
           git config user.email "actions-bot@users.noreply.github.com"
@@ -56,12 +58,18 @@ jobs:
             cp mouse-side-keys-rs/build.log build.log
           fi
 
-          EXE=$(ls mouse-side-keys-rs/target/release/*.exe 2>/dev/null | head -1)
+          # 用 glob 而不是 `ls | head`：GitHub 的 bash 默认带 -e -o pipefail，
+          # 没有 exe 时 `ls` 失败会让整条管道失败并中断整个步骤。
+          EXE=""
+          for f in mouse-side-keys-rs/target/release/*.exe; do
+            if [ -f "$f" ]; then EXE="$f"; break; fi
+          done
           if [ -n "$EXE" ]; then
             cp "$EXE" mouse-side-keys-rs.exe
           fi
 
-          git add -f build.log
+          if [ -f build.log ]; then git add -f build.log; fi
           if [ -f mouse-side-keys-rs.exe ]; then git add -f mouse-side-keys-rs.exe; fi
-          git commit -m "build output $(date -u +%Y%m%dT%H%M%SZ)" || echo "nothing to commit"
-          git push -f origin build-output
+
+          git -c commit.gpgsign=false commit -m "build output $(date -u +%Y%m%dT%H%M%SZ)" || echo "nothing to commit"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" build-output
