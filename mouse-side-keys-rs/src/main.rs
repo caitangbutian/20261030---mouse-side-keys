@@ -1051,7 +1051,7 @@ fn activate_existing_window() -> bool {
     unsafe {
         let h = FindWindowW(bg.as_ptr(), std::ptr::null());
         if h != 0 {
-            let _ = SendMessageW(h, WM_TRAY, 0, WM_LBUTTONDBLCLK as WPARAM);
+            let _ = SendMessageW(h, WM_TRAY, 0, WM_LBUTTONDBLCLK as LPARAM);
             return true;
         }
     }
