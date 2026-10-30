@@ -141,8 +141,8 @@ const MB_OK: u32 = 0x0000_0000;
 const MB_YESNOCANCEL: u32 = 0x0000_0003;
 const MB_ICONQUESTION: u32 = 0x0000_0020;
 
-// MessageBoxW 的按钮返回值
-const IDYES: i32 = 6;
+// MessageBoxW 的按钮返回值（现在只有建窗失败的兜底分支会用到）
+#[allow(dead_code)]
 const IDNO: i32 = 7;
 const IDCANCEL: i32 = 2;
 
@@ -228,6 +228,273 @@ fn show_message(title: &str, text: &str, flags: u32) -> i32 {
     let w = to_wide(text);
     let cap = to_wide(title);
     unsafe { MessageBoxW(0, w.as_ptr(), cap.as_ptr(), flags) }
+}
+
+// --------------------------------------------------------------------------
+// 「已在运行」对话框
+//
+// 系统 MessageBoxW 的按钮文字写死成「是 / 否 / 取消」，改不了；要显示
+// 「重新运行 / 立即结束」只能自己建一个 Win32 窗口。纯 user32 + gdi32（仅取字体），
+// 不引入任何 crate 依赖，体积不变。
+//
+// 安全说明：这里**可以**阻塞当前线程 —— 本对话框只在 main() 里、安装
+// WH_MOUSE_LL 钩子**之前**调用，此时阻塞不会冻结鼠标输入。
+// （对比：UIPI 提示框必须走独立线程，因为那时钩子已经装上了。）
+// --------------------------------------------------------------------------
+
+/// 用户对「已在运行」的选择。
+enum RunningChoice {
+    Keep,    // 什么都不做，让现有实例继续跑
+    Restart, // 结束旧实例并重新启动
+    Stop,    // 结束旧实例并且不再启动
+}
+
+const WS_POPUP: u32 = 0x8000_0000;
+const WS_CAPTION: u32 = 0x00C0_0000;
+const WS_SYSMENU: u32 = 0x0008_0000;
+const WS_VISIBLE: u32 = 0x1000_0000;
+const WS_DLGFRAME: u32 = 0x0040_0000;
+const WS_CHILD: u32 = 0x4000_0000;
+const WS_TABSTOP: u32 = 0x0001_0000;
+const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
+const WS_EX_TOPMOST: u32 = 0x0000_0008;
+const WS_EX_DLGMODALFRAME: u32 = 0x0000_0001;
+
+const WM_SETFONT: u32 = 0x0030;
+const WM_CLOSE: u32 = 0x0010;
+const WM_DESTROY: u32 = 0x0002;
+const WM_COMMAND: u32 = 0x0111;
+const SM_CXSCREEN: i32 = 0;
+const SM_CYSCREEN: i32 = 1;
+const DEFAULT_GUI_FONT: i32 = 17;
+
+const ID_RESTART: isize = 1001;
+const ID_STOP: isize = 1002;
+
+/// 对话框结果：0 = 保持，1 = 重新运行，2 = 立即结束。
+static DLG_RESULT: AtomicU32 = AtomicU32::new(0);
+
+#[repr(C)]
+struct WNDCLASSW {
+    style: u32,
+    lpfn_wnd_proc: Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT>,
+    cb_cls_extra: i32,
+    cb_wnd_extra: i32,
+    h_instance: HINSTANCE,
+    h_icon: HANDLE,
+    h_cursor: HANDLE,
+    h_brush_background: HANDLE,
+    lpsz_menu_name: *const u16,
+    lpsz_class_name: *const u16,
+}
+
+// 这些函数在 windows-sys 0.52 里模块位置不好猜，直接手写 FFI；user32 已被
+// 上面的调用带入链接。注意句柄类型一律是 isize，不是指针。
+unsafe extern "system" {
+    fn RegisterClassW(lpWndClass: *const WNDCLASSW) -> u16;
+    fn CreateWindowExW(
+        dw_ex_style: u32,
+        lp_class_name: *const u16,
+        lp_window_name: *const u16,
+        dw_style: u32,
+        x: i32,
+        y: i32,
+        n_width: i32,
+        n_height: i32,
+        h_wnd_parent: HWND,
+        h_menu: isize,
+        h_instance: HINSTANCE,
+        lp_param: *const std::ffi::c_void,
+    ) -> HWND;
+    fn DefWindowProcW(h_wnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM) -> LRESULT;
+    fn GetMessageW(lp_msg: *mut MSG, h_wnd: HWND, filter_min: u32, filter_max: u32) -> BOOL;
+    fn DestroyWindow(h_wnd: HWND) -> BOOL;
+    fn SendMessageW(h_wnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM) -> LRESULT;
+    fn SetForegroundWindow(h_wnd: HWND) -> BOOL;
+    fn SetFocus(h_wnd: HWND) -> HWND;
+    fn GetSystemMetrics(n_index: i32) -> i32;
+    fn PostQuitMessage(n_exit_code: i32);
+}
+
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    fn GetStockObject(i: i32) -> HANDLE;
+}
+
+unsafe extern "system" fn ask_dlg_proc(
+    h_wnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_COMMAND => {
+            let id = (w_param & 0xFFFF) as isize;
+            if id == ID_RESTART {
+                DLG_RESULT.store(1, Ordering::Relaxed);
+                DestroyWindow(h_wnd);
+            } else if id == ID_STOP {
+                DLG_RESULT.store(2, Ordering::Relaxed);
+                DestroyWindow(h_wnd);
+            }
+            0
+        }
+        WM_CLOSE => {
+            // 关窗 = 保持现状（什么都不做），等价于原来的「否」
+            DestroyWindow(h_wnd);
+            0
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            0
+        }
+        _ => DefWindowProcW(h_wnd, msg, w_param, l_param),
+    }
+}
+
+/// 弹出「程序已在运行」对话框，阻塞直到用户做出选择。
+fn ask_running_choice() -> RunningChoice {
+    const W: i32 = 440;
+    const H: i32 = 210;
+
+    unsafe {
+        let class_name = to_wide("MouseSideKeysAskClass");
+        let mut wc: WNDCLASSW = std::mem::zeroed();
+        wc.lpfn_wnd_proc = Some(ask_dlg_proc);
+        wc.h_instance = 0;
+        wc.h_cursor = 0;
+        wc.h_icon = 0;
+        wc.h_brush_background = 16; // COLOR_BTNFACE + 1（系统颜色刷，无需创建 GDI 对象）
+        wc.lpsz_class_name = class_name.as_ptr();
+        // 同一进程重复注册同名类会失败，忽略返回值即可（类已存在照样能用）
+        let _ = RegisterClassW(&wc);
+
+        let title = to_wide("鼠标侧键切换");
+        let body = to_wide("程序已在运行，请确认已开启多窗口！\n（win+tab可查看多窗口）");
+        let hint = to_wide("直接关闭本窗口 = 保持不变，继续运行");
+        let b1_text = to_wide("重新运行");
+        let b2_text = to_wide("立即结束");
+
+        let sx = GetSystemMetrics(SM_CXSCREEN);
+        let sy = GetSystemMetrics(SM_CYSCREEN);
+        let x = if sx > W { (sx - W) / 2 } else { 0 };
+        let y = if sy > H { (sy - H) / 2 } else { 0 };
+
+        let hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
+            class_name.as_ptr(),
+            title.as_ptr(),
+            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_DLGFRAME,
+            x,
+            y,
+            W,
+            H,
+            0,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        if hwnd == 0 {
+            // 极少数情况下建窗失败：退回系统消息框，保证功能不丢。
+            let r = show_message(
+                "鼠标侧键切换 —— 已经在运行",
+                "本程序已经在运行了。\n\n\
+                 是(Y) —— 结束旧实例并重新启动\n\
+                 否(N) —— 保持不变，让现在这个实例继续运行\n\
+                 取消   —— 结束旧实例，并且不再启动\n",
+                MB_YESNOCANCEL | MB_ICONQUESTION,
+            );
+            return match r {
+                IDYES => RunningChoice::Restart,
+                IDCANCEL => RunningChoice::Stop,
+                _ => RunningChoice::Keep,
+            };
+        }
+
+        let font = GetStockObject(DEFAULT_GUI_FONT);
+        let static_cls = to_wide("Static");
+        let button_cls = to_wide("Button");
+
+        let h_body = CreateWindowExW(
+            0,
+            static_cls.as_ptr(),
+            body.as_ptr(),
+            WS_CHILD | WS_VISIBLE,
+            24,
+            18,
+            392,
+            54,
+            hwnd,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        SendMessageW(h_body, WM_SETFONT, font as WPARAM, 1);
+
+        let h_hint = CreateWindowExW(
+            0,
+            static_cls.as_ptr(),
+            hint.as_ptr(),
+            WS_CHILD | WS_VISIBLE,
+            24,
+            124,
+            392,
+            20,
+            hwnd,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        SendMessageW(h_hint, WM_SETFONT, font as WPARAM, 1);
+
+        let h_restart = CreateWindowExW(
+            0,
+            button_cls.as_ptr(),
+            b1_text.as_ptr(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            68,
+            80,
+            132,
+            34,
+            hwnd,
+            ID_RESTART,
+            0,
+            std::ptr::null(),
+        );
+        SendMessageW(h_restart, WM_SETFONT, font as WPARAM, 1);
+
+        let h_stop = CreateWindowExW(
+            0,
+            button_cls.as_ptr(),
+            b2_text.as_ptr(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            224,
+            80,
+            132,
+            34,
+            hwnd,
+            ID_STOP,
+            0,
+            std::ptr::null(),
+        );
+        SendMessageW(h_stop, WM_SETFONT, font as WPARAM, 1);
+
+        // 置前并聚焦，避免窗口被别的窗口盖住而用户以为没反应
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetFocus(h_restart);
+
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, 0, 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    match DLG_RESULT.swap(0, Ordering::Relaxed) {
+        1 => RunningChoice::Restart,
+        2 => RunningChoice::Stop,
+        _ => RunningChoice::Keep,
+    }
 }
 
 /// 命令模式（--stop / --test / --list-presets / --elevate）结束前调用：
@@ -974,22 +1241,17 @@ fn main() {
                 }
             }
         } else {
-            let choice = show_message(
-                "鼠标侧键切换 —— 已经在运行",
-                "本程序已经在运行了。\n\n\
-                 是(Y) —— 结束旧实例并重新启动（改过启动参数时选这个）\n\
-                 否(N) —— 什么都不做，让现在这个实例继续运行\n\
-                 取消   —— 结束旧实例，并且不再启动（相当于停止）\n",
-                MB_YESNOCANCEL | MB_ICONQUESTION,
-            );
+            // 双击运行、无控制台：弹自定义对话框（按钮 = 重新运行 / 立即结束）
+            let choice = ask_running_choice();
             match choice {
-                IDCANCEL => {
+                RunningChoice::Stop => {
+                    // 结束旧实例，并且不再启动
                     takeover_old_instance();
                     remove_pid_file();
                     return;
                 }
-                IDNO => return, // 保持现状：旧实例继续跑，本进程直接退出
-                IDYES => {
+                RunningChoice::Keep => return, // 保持现状：旧实例继续跑，本进程直接退出
+                RunningChoice::Restart => {
                     // 接管（结束旧实例）后继续启动
                     takeover_old_instance();
                     match check_single_instance() {
@@ -1005,7 +1267,6 @@ fn main() {
                         }
                     }
                 }
-                _ => return,
             }
         }
     } else {
