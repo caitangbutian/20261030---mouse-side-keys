@@ -44,7 +44,7 @@
 use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
@@ -137,6 +137,15 @@ const MB_ICONWARNING: u32 = 0x0000_0030;
 const MB_SETFOREGROUND: u32 = 0x0001_0000;
 const SW_SHOWNORMAL: i32 = 1;
 
+const MB_OK: u32 = 0x0000_0000;
+const MB_YESNOCANCEL: u32 = 0x0000_0003;
+const MB_ICONQUESTION: u32 = 0x0000_0020;
+
+// MessageBoxW 的按钮返回值
+const IDYES: i32 = 6;
+const IDNO: i32 = 7;
+const IDCANCEL: i32 = 2;
+
 // GetTokenInformation 的 TokenInformationClass 取值（避免依赖枚举变体名）
 const TOKEN_INTEGRITY_LEVEL: i32 = 25;
 
@@ -179,7 +188,21 @@ fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// 向（已附加的）父控制台写文本。后台无控制台时静默，等价于 Python 的 _note。
+/// 已输出内容的副本：无控制台（双击运行）时，命令结束前用它弹一个窗，
+/// 否则用户完全看不到 --stop / --test / --list-presets 的结果。
+static OUT_BUF: OnceLock<Mutex<String>> = OnceLock::new();
+
+fn out_buf() -> &'static Mutex<String> {
+    OUT_BUF.get_or_init(|| Mutex::new(String::new()))
+}
+
+/// 是否有可用控制台（只有从 cmd / 终端启动时才有）。
+fn has_console() -> bool {
+    unsafe { GetConsoleWindow() != 0 }
+}
+
+/// 向（已附加的）父控制台写文本。等价于 Python 的 _note。
+/// 无论有没有控制台，都同时记进 OUT_BUF，供 finish_output() 兜底弹窗。
 fn out(s: &str) {
     let wide = to_wide(s);
     unsafe {
@@ -195,6 +218,33 @@ fn out(s: &str) {
             );
         }
     }
+    if let Ok(mut b) = out_buf().lock() {
+        b.push_str(s);
+    }
+}
+
+/// 弹一个消息框，返回用户点的按钮（IDYES / IDNO / IDCANCEL ...）。
+fn show_message(title: &str, text: &str, flags: u32) -> i32 {
+    let w = to_wide(text);
+    let cap = to_wide(title);
+    unsafe { MessageBoxW(0, w.as_ptr(), cap.as_ptr(), flags) }
+}
+
+/// 命令模式（--stop / --test / --list-presets / --elevate）结束前调用：
+/// 没有控制台时把本次输出汇总弹出来，避免双击运行后什么反馈都看不到。
+fn finish_output() {
+    if has_console() {
+        return;
+    }
+    let text = match out_buf().lock() {
+        Ok(b) => b.clone(),
+        Err(_) => return,
+    };
+    let t = text.trim_end().to_string();
+    if t.is_empty() {
+        return;
+    }
+    show_message("鼠标侧键切换", &t, MB_OK | MB_SETFOREGROUND);
 }
 
 /// 若当前没有控制台、但有父控制台（从 cmd/终端启动），则附加过去，
@@ -360,8 +410,8 @@ fn flush(seq: &[INPUT]) -> bool {
             let _err = GetLastError();
             if sent == 0 {
                 // 一个都发不出去，基本就是权限隔离（UIPI）或输入被阻塞
-                if let Some(hint) = uipi_check() {
-                    warn_uipi_dialog(&hint);
+                if let Some(hint) = cached_uipi_hint() {
+                    warn_uipi_dialog(hint);
                 }
             }
             release_modifiers();
@@ -527,6 +577,14 @@ fn uipi_check() -> Option<String> {
     ))
 }
 
+/// UIPI 检测结果缓存：uipi_check() 要 OpenProcess + OpenProcessToken +
+/// GetTokenInformation，逐个事件都查一遍既慢又没必要（结果不会变）。
+static UIPI_HINT: OnceLock<Option<String>> = OnceLock::new();
+
+fn cached_uipi_hint() -> Option<&'static str> {
+    UIPI_HINT.get_or_init(|| uipi_check()).as_deref()
+}
+
 fn warn_uipi_dialog(hint: &str) {
     if UIPI_SHOWN.swap(true, Ordering::Relaxed) {
         return; // 每次会话最多弹一次，避免反复打扰
@@ -538,16 +596,18 @@ fn warn_uipi_dialog(hint: &str) {
          或对 exe 设置「以管理员身份运行」兼容性选项。",
         hint
     );
-    let w = to_wide(&text);
-    let cap = to_wide("鼠标侧键切换 —— 按键被系统拦截");
-    unsafe {
-        let _ = MessageBoxW(
-            0,
-            w.as_ptr(),
-            cap.as_ptr(),
+    // 极其关键：MessageBoxW 是模态的，会一直阻塞调用线程直到用户点掉。
+    // 调用方是 run() 的主循环线程，而低级鼠标钩子（WH_MOUSE_LL）就装在这个线程上；
+    // 一旦在这里被阻塞，系统鼠标输入会整体卡死 / 严重卡顿 ——
+    // 这正是「一运行起来鼠标就变得非常卡顿」的根因。
+    // 所以弹窗必须扔到独立线程去弹，主循环继续泵消息，鼠标不受影响。
+    std::thread::spawn(move || {
+        show_message(
+            "鼠标侧键切换 —— 按键被系统拦截",
+            &text,
             MB_ICONWARNING | MB_SETFOREGROUND,
         );
-    }
+    });
 }
 
 // --------------------------------------------------------------------------
@@ -868,10 +928,12 @@ fn main() {
 
     if list_presets {
         list_presets_cmd();
+        finish_output();
         return;
     }
     if stop {
         cmd_stop();
+        finish_output();
         return;
     }
 
@@ -880,30 +942,86 @@ fn main() {
     if elevate {
         if integrity_level(None).unwrap_or(0) >= 0x3000 {
             out("当前已是管理员权限，无需提权。\n");
-            return;
-        }
-        if relaunch_elevated() {
+        } else if relaunch_elevated() {
             out("已请求管理员权限重启（请在 UAC 弹窗中确认）。\n");
-            return;
+        } else {
+            out("[错误] 提权重启被取消或失败（UAC 弹窗被拒绝？）。\n");
         }
-        out("[错误] 提权重启被取消或失败（UAC 弹窗被拒绝？）。\n");
+        finish_output();
         return;
     }
 
     if test {
         cmd_test(&preset);
+        finish_output();
         return;
     }
 
-    // 先接管上一版残留的进程，避免「改了代码却还在跑旧版」。
-    takeover_old_instance();
-
-    // 关键：单实例互斥体。返回 None 说明已有实例在跑。
-    let _mutex = match check_single_instance() {
-        Some(h) => h, // 持有至 main 结束（进程退出时由系统释放）
-        None => {
-            out("仍有另一个实例在运行（或其它目录的副本）。请先运行 --stop。\n");
-            return;
+    // 单实例：先看有没有已经在跑的实例。
+    //
+    // 双击运行时没有控制台，out() 写的东西用户根本看不到，所以不能只靠打印，
+    // 必须弹窗让用户明确选择怎么处理已经在运行的那个实例。
+    let _mutex = if mutex_exists() {
+        if has_console() {
+            // 从终端启动：保持原来脚本友好的行为，直接接管重启（不弹窗打扰）。
+            out("检测到已有实例在运行：结束旧实例并重新启动。\n");
+            takeover_old_instance();
+            match check_single_instance() {
+                Some(h) => h,
+                None => {
+                    out("[错误] 结束旧实例失败，或旧实例尚未退出。\n");
+                    return;
+                }
+            }
+        } else {
+            let choice = show_message(
+                "鼠标侧键切换 —— 已经在运行",
+                "本程序已经在运行了。\n\n\
+                 是(Y) —— 结束旧实例并重新启动（改过启动参数时选这个）\n\
+                 否(N) —— 什么都不做，让现在这个实例继续运行\n\
+                 取消   —— 结束旧实例，并且不再启动（相当于停止）\n",
+                MB_YESNOCANCEL | MB_ICONQUESTION,
+            );
+            match choice {
+                IDCANCEL => {
+                    takeover_old_instance();
+                    remove_pid_file();
+                    return;
+                }
+                IDNO => return, // 保持现状：旧实例继续跑，本进程直接退出
+                IDYES => {
+                    // 接管（结束旧实例）后继续启动
+                    takeover_old_instance();
+                    match check_single_instance() {
+                        Some(h) => h,
+                        None => {
+                            show_message(
+                                "鼠标侧键切换",
+                                "结束旧实例失败，或旧实例还没有完全退出。\n\
+                                 请稍候再试，或用任务管理器结束后重试。",
+                                MB_ICONWARNING | MB_SETFOREGROUND,
+                            );
+                            return;
+                        }
+                    }
+                }
+                _ => return,
+            }
+        }
+    } else {
+        // 没有其它实例：仍然清理上一版残留（--stop 没跑干净 / 旧版进程），
+        // 避免「改了代码却还在跑旧版」。
+        takeover_old_instance();
+        match check_single_instance() {
+            Some(h) => h,
+            None => {
+                show_message(
+                    "鼠标侧键切换",
+                    "启动失败：无法创建单实例互斥体。",
+                    MB_ICONWARNING | MB_SETFOREGROUND,
+                );
+                return;
+            }
         }
     };
 
