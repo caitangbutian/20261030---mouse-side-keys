@@ -48,19 +48,33 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    BOOL, CloseHandle, GetCurrentProcessId, GetLastError, HANDLE, HINSTANCE, HMODULE, HWND,
-    LRESULT, LPARAM, WPARAM,
+    BOOL, CloseHandle, GetLastError, HANDLE, HINSTANCE, HMODULE, HWND, LRESULT, LPARAM, WPARAM,
 };
-use windows_sys::Win32::Security::{
-    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, OpenProcessToken,
-    TOKEN_INFORMATION_CLASS, PSID,
-};
+use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_INFORMATION_CLASS};
 use windows_sys::Win32::System::Console::{
     AttachConsole, GetConsoleWindow, GetStdHandle, SetConsoleCtrlHandler, WriteConsoleW,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, GetCurrentThreadId, GetModuleHandleW, OpenMutexW, OpenProcess,
+    CreateMutexW, GetCurrentThreadId, OpenMutexW, OpenProcess,
 };
+
+// 这几个函数在 windows-sys 0.52 里的模块位置和预期不符（OpenProcessToken 不在
+// Win32::Security、GetModuleHandleW 不在 System::Threading、UnhookWindowsHookEx
+// 需要单独导入、PSID 类型别名根本没有导出），与其反复去猜模块路径，不如直接
+// 声明 FFI：它们分别位于 kernel32 / user32 / advapi32，而这些导入库已经被上面
+// windows-sys 的调用带入链接，符号一定能解析。
+//
+// 重要：windows-sys 0.52 的句柄类型（HANDLE / HWND / HHOOK / HMODULE）都是 isize，
+// **不是指针**。所以这里参数与返回值一律用 isize，调用处也不能再传 null_mut()，
+// 判断空句柄要写 `== 0` 而不是 `.is_null()`。
+unsafe extern "system" {
+    fn GetCurrentProcessId() -> u32;
+    fn GetModuleHandleW(lpModuleName: *const u16) -> isize;
+    fn UnhookWindowsHookEx(hhk: isize) -> BOOL;
+    fn OpenProcessToken(process: isize, desired_access: u32, token_handle: *mut isize) -> BOOL;
+    fn GetSidSubAuthorityCount(pSid: *mut std::ffi::c_void) -> *mut u8;
+    fn GetSidSubAuthority(pSid: *mut std::ffi::c_void, nSubAuthority: u32) -> *mut u32;
+}
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, MapVirtualKeyW, SendInput, INPUT, INPUT_0, KEYBDINPUT,
 };
@@ -174,7 +188,7 @@ fn out(s: &str) {
             let mut written: u32 = 0;
             let _ = WriteConsoleW(
                 h,
-                wide.as_ptr(),
+                wide.as_ptr() as *const std::ffi::c_void,
                 (wide.len() - 1) as u32,
                 &mut written,
                 std::ptr::null_mut(),
@@ -187,7 +201,8 @@ fn out(s: &str) {
 /// 这样 --test / --list-presets / --stop 等命令的输出才可见。
 fn attach_parent_console() {
     unsafe {
-        if GetConsoleWindow().is_null() {
+        // HWND 在 windows-sys 0.52 里是 isize，不能用 .is_null()
+        if GetConsoleWindow() == 0 {
             let _ = AttachConsole(ATTACH_PARENT_PROCESS);
         }
     }
@@ -222,7 +237,7 @@ fn check_single_instance() -> Option<HANDLE> {
     let name_w = to_wide(MUTEX_NAME);
     unsafe {
         let h = CreateMutexW(std::ptr::null(), 0, name_w.as_ptr());
-        if h.is_null() {
+        if h == 0 {
             return None;
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
@@ -237,7 +252,7 @@ fn mutex_exists() -> bool {
     let name_w = to_wide(MUTEX_NAME);
     unsafe {
         let h = OpenMutexW(SYNCHRONIZE, 0, name_w.as_ptr());
-        if !h.is_null() {
+        if h != 0 {
             let _ = CloseHandle(h);
             true
         } else {
@@ -431,20 +446,20 @@ fn integrity_level(pid: Option<u32>) -> Option<u32> {
         let proc = match pid {
             None => {
                 let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, GetCurrentProcessId());
-                if h.is_null() {
+                if h == 0 {
                     return None;
                 }
                 h
             }
             Some(p) => {
                 let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, p);
-                if h.is_null() {
+                if h == 0 {
                     return None;
                 }
                 h
             }
         };
-        let mut token: HANDLE = std::ptr::null_mut();
+        let mut token: HANDLE = 0;
         if OpenProcessToken(proc, TOKEN_QUERY, &mut token) == 0 {
             return None;
         }
@@ -462,11 +477,11 @@ fn integrity_level(pid: Option<u32>) -> Option<u32> {
         }
         let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
         let sid = label.Label.Sid;
-        let cnt = GetSidSubAuthorityCount(sid as PSID);
+        let cnt = GetSidSubAuthorityCount(sid);
         if cnt.is_null() {
             return None;
         }
-        let sub = GetSidSubAuthority(sid as PSID, (*cnt as u32).wrapping_sub(1));
+        let sub = GetSidSubAuthority(sid, (*cnt as u32).wrapping_sub(1));
         if sub.is_null() {
             return None;
         }
@@ -490,7 +505,7 @@ fn describe_level(level: u32) -> String {
 fn uipi_check() -> Option<String> {
     let mine = integrity_level(None)?;
     let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.is_null() {
+    if hwnd == 0 {
         return None;
     }
     let mut pid: u32 = 0;
@@ -527,7 +542,7 @@ fn warn_uipi_dialog(hint: &str) {
     let cap = to_wide("鼠标侧键切换 —— 按键被系统拦截");
     unsafe {
         let _ = MessageBoxW(
-            std::ptr::null_mut(),
+            0,
             w.as_ptr(),
             cap.as_ptr(),
             MB_ICONWARNING | MB_SETFOREGROUND,
@@ -584,7 +599,7 @@ unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARA
             }
         }
     }
-    CallNextHookEx(std::ptr::null_mut(), n_code, w_param, l_param)
+    CallNextHookEx(0, n_code, w_param, l_param)
 }
 
 unsafe extern "system" fn ctrl_handler(_ctrl: u32) -> BOOL {
@@ -609,7 +624,7 @@ fn run() {
     unsafe {
         let hmod: HMODULE = GetModuleHandleW(std::ptr::null());
         let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), hmod as HINSTANCE, 0);
-        if hook.is_null() {
+        if hook == 0 {
             out(&format!(
                 "[错误] SetWindowsHookExW 失败，错误码 {}\n",
                 GetLastError()
@@ -633,7 +648,7 @@ fn run() {
                 QS_ALLINPUT,
                 MWMO_INPUTAVAILABLE,
             );
-            while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            while PeekMessageW(&mut msg, 0, 0, 0, PM_REMOVE) != 0 {
                 if msg.message == WM_APP_TRIGGER {
                     send_ctrl_win_arrow(msg.wParam as u32);
                 } else if msg.message == WM_QUIT {
@@ -680,7 +695,7 @@ fn relaunch_elevated() -> bool {
     let runas_w = to_wide("runas");
     unsafe {
         let r = ShellExecuteW(
-            std::ptr::null_mut(),
+            0,
             runas_w.as_ptr(),
             exe_w.as_ptr(),
             if params.is_empty() {
@@ -719,11 +734,11 @@ fn preset_desc(name: &str) -> &'static str {
     }
 }
 
-fn build_chain(preset: &str) -> Vec<&'static str> {
-    let mut v: Vec<&str> = vec![preset];
+fn build_chain(preset: &str) -> Vec<String> {
+    let mut v: Vec<String> = vec![preset.to_string()];
     for p in ["raw", "split", "default"] {
         if p != preset {
-            v.push(p);
+            v.push(p.to_string());
         }
     }
     v
@@ -747,8 +762,8 @@ fn cmd_test(preset: &str) {
     }
     out("\n");
     for name in build_chain(preset) {
-        out(&format!("--> 方式 {:<8} {}\n", name, preset_desc(name)));
-        out!("    正在发送一次 Ctrl+Win+Right，请观察桌面是否切换 ...\n");
+        out(&format!("--> 方式 {:<8} {}\n", name, preset_desc(&name)));
+        out("    正在发送一次 Ctrl+Win+Right，请观察桌面是否切换 ...\n");
         let (raw, ext, gap, split) = preset_params(name);
         let ok = send_with(VK_RIGHT, raw, ext, gap, split);
         out(&format!(
