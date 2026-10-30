@@ -1,0 +1,44 @@
+name: build
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build Windows x64 exe
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable (msvc)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            mouse-side-keys-rs/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('mouse-side-keys-rs/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo build --release
+        working-directory: mouse-side-keys-rs
+        run: cargo build --release
+
+      - name: Show built binary
+        shell: bash
+        run: ls -l mouse-side-keys-rs/target/release/*.exe
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mouse-side-keys-rs-windows-x64
+          path: mouse-side-keys-rs/target/release/*.exe
+          if-no-files-found: error

@@ -1,0 +1,18 @@
+# 把链接子系统设为 Windows（/SUBSYSTEM:WINDOWS）：运行时没有控制台窗口，
+# 进程也不会因为启动它的控制台被关闭而随之被杀 —— 等价于 Python 版用 pythonw
+# 后台化的效果。常驻运行时完全无窗口、静默；需要看输出时用 --test / --stop
+# 从 cmd/终端启动，程序会 AttachConsole 到父控制台再打印。
+#
+# 覆盖 MSVC 与 GNU 两种工具链。若只装了一种，无关条目会被忽略。
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-args=/SUBSYSTEM:WINDOWS"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "link-args=/SUBSYSTEM:WINDOWS"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-args=-Wl,--subsystem,windows"]
+
+[target.i686-pc-windows-gnu]
+rustflags = ["-C", "link-args=-Wl,--subsystem,windows"]

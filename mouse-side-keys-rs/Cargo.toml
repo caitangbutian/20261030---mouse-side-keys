@@ -1,0 +1,28 @@
+[package]
+name = "mouse-side-keys-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Mouse side buttons -> Windows virtual desktop switch (Rust, zero runtime, pure Win32)"
+default-run = "mouse-side-keys-rs"
+
+[dependencies]
+# windows-sys: 纯链接期绑定，不带任何运行时 / GC / 解释器。
+# 只启用真正用到的 Win32 功能模块，避免把整套 API 编进二进制。
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_Security",
+] }
+
+[profile.release]
+# 体积与资源优先：最高压缩优化 + 全程序 LTO + 剥符号表 + 关闭 unwind 栈展开。
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1
