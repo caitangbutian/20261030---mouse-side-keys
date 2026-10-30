@@ -43,7 +43,7 @@
 
 use std::io::Write;
 use std::os::windows::process::CommandExt;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -352,6 +352,16 @@ unsafe extern "system" fn ask_dlg_proc(
     }
 }
 
+/// 模态消息循环：跑到这里阻塞，直到 PostQuitMessage 被调用。
+/// （这两个对话框都在安装钩子之前弹出，所以阻塞不会冻结鼠标。）
+unsafe fn modal_loop() {
+    let mut msg: MSG = std::mem::zeroed();
+    while GetMessageW(&mut msg, 0, 0, 0) > 0 {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
 /// 弹出「程序已在运行」对话框，阻塞直到用户做出选择。
 fn ask_running_choice() -> RunningChoice {
     const W: i32 = 440;
@@ -483,11 +493,7 @@ fn ask_running_choice() -> RunningChoice {
         let _ = SetForegroundWindow(hwnd);
         let _ = SetFocus(h_restart);
 
-        let mut msg: MSG = std::mem::zeroed();
-        while GetMessageW(&mut msg, 0, 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        modal_loop();
     }
 
     match DLG_RESULT.swap(0, Ordering::Relaxed) {
@@ -1038,6 +1044,426 @@ fn relaunch_elevated() -> bool {
 }
 
 // --------------------------------------------------------------------------
+// 开机启动：安装 / 注册计划任务
+//
+// 为什么用「计划任务」而不是注册表 Run 项：
+//   Run 项启动的进程是标准权限（Medium），侧键会被 UIPI 拦掉（360 之类
+//   High 权限窗口聚焦时失效）。计划任务可以设 RunLevel=HIGHEST，登录时
+//   静默以最高权限启动，不弹 UAC 打断。
+//   实测：不勾「使用最高权限运行」，登录时会 ERROR_ELEVATION_REQUIRED 静默失败；
+//   笔记本还要取消「只在交流电源时启动」，否则电池状态下开机不触发。
+// --------------------------------------------------------------------------
+
+const TASK_NAME: &str = "MouseSideKeys";
+const INSTALLED_EXE_NAME: &str = "MouseSideKeys.exe";
+const MAX_PATH: usize = 260;
+
+/// 计划任务是否已注册。只看进程返回码，不解析输出（中文系统是 GBK，解析易错）。
+fn startup_task_registered() -> bool {
+    match std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        Ok(o) => o.status.success(),
+        Err(_) => false,
+    }
+}
+
+fn default_install_dir() -> String {
+    let base = std::env::var("LOCALAPPDATA")
+        .or_else(|_| std::env::var("APPDATA"))
+        .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
+    let base = base.trim_end_matches(|c| c == '\\' || c == '/').to_string();
+    format!("{}\\MouseSideKeys", base)
+}
+
+fn install_skip_path() -> String {
+    format!("{}\\.skip_install", default_install_dir())
+}
+
+/// 用户点过「以后再说」后不再每次启动都弹安装框。
+fn install_skipped() -> bool {
+    std::path::Path::new(&install_skip_path()).exists()
+}
+
+fn mark_install_skipped() {
+    let p = install_skip_path();
+    if let Some(d) = std::path::Path::new(&p).parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(&p, "1");
+}
+
+fn same_path(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.replace('/', "\\").to_lowercase();
+    norm(a) == norm(b)
+}
+
+/// 执行安装：复制自身到 dir → 注册计划任务 → 从新位置启动一次。
+/// 必须以管理员权限运行，否则 /RL HIGHEST 会失败。
+fn do_install(dir: &str) {
+    let dir = dir.trim_end_matches(|c| c == '\\' || c == '/').to_string();
+    if dir.is_empty() {
+        out("[错误] 安装目录为空。\n");
+        return;
+    }
+    let src = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let dst = format!("{}\\{}", dir, INSTALLED_EXE_NAME);
+
+    if same_path(&src, &dst) {
+        out("已经在目标位置，跳过复制。\n");
+    } else {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            out(&format!("[错误] 无法创建目录 {}：{}\n", dir, e));
+            return;
+        }
+        match std::fs::copy(&src, &dst) {
+            Ok(_) => out(&format!("已复制自身到：{}\n", dst)),
+            Err(e) => {
+                out(&format!("[错误] 复制失败：{}\n", e));
+                return;
+            }
+        }
+    }
+
+    let tr = format!("\"{}\"", dst);
+    match std::process::Command::new("schtasks")
+        .args([
+            "/Create", "/TN", TASK_NAME, "/TR", tr.as_str(), "/SC", "ONLOGON", "/RL", "HIGHEST",
+            "/F",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        Ok(o) if o.status.success() => out(&format!("已注册开机启动任务：{}\n", TASK_NAME)),
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let err2 = String::from_utf8_lossy(&o.stdout);
+            out(&format!(
+                "[错误] 注册计划任务失败（需要管理员权限）。\n{}\n",
+                if err.trim().is_empty() { err2.trim() } else { err.trim() }
+            ));
+            return;
+        }
+        Err(e) => {
+            out(&format!("[错误] 无法执行 schtasks：{}\n", e));
+            return;
+        }
+    }
+
+    // 笔记本：取消「只在交流电源时启动」，否则电池状态下开机不触发。尽力而为，失败不影响。
+    let ps = format!(
+        "$s = New-ScheduledTaskSettingsSet -DisallowStartIfOnBatteries:$false -AllowStartIfOnBatteries:$true -DontStopIfGoingOnBatteries:$true; Set-ScheduledTask -TaskName '{}' -Settings $s",
+        TASK_NAME
+    );
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", ps.as_str()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
+    // 从新位置启动一次，完成「安装即可用」。
+    match std::process::Command::new(&dst)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+    {
+        Ok(_) => out("已从新位置启动一次，功能即刻生效。\n"),
+        Err(e) => out(&format!("[警告] 启动新实例失败：{}\n", e)),
+    }
+}
+
+/// 以管理员权限重启自身，并带上指定命令行参数（用于 --install 的安装流程）。
+fn relaunch_elevated_with(args_line: &str) -> bool {
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if exe.is_empty() {
+        return false;
+    }
+    let exe_w = to_wide(&exe);
+    let params_w = to_wide(args_line);
+    let runas_w = to_wide("runas");
+    unsafe {
+        let r = ShellExecuteW(
+            0,
+            runas_w.as_ptr(),
+            exe_w.as_ptr(),
+            params_w.as_ptr(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+        (r as isize) > 32
+    }
+}
+
+fn parse_install_arg() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--install" && i + 1 < args.len() {
+            return Some(args[i + 1].clone());
+        }
+        if let Some(v) = args[i].strip_prefix("--install=") {
+            return Some(v.to_string());
+        }
+        i += 1;
+    }
+    None
+}
+
+// ---- 安装位置选择对话框（纯 Win32，无依赖） ----
+
+const ES_AUTOHSCROLL: u32 = 0x0080;
+const WS_BORDER: u32 = 0x0080_0000;
+const BIF_RETURNONLYFSDIRS: u32 = 0x0001;
+const BIF_NEWDIALOGSTYLE: u32 = 0x0040;
+const BIF_EDITBOX: u32 = 0x0010;
+const COINIT_APARTMENTTHREADED: u32 = 0x2;
+
+const ID_EDIT: isize = 2001;
+const ID_BROWSE: isize = 2002;
+const ID_INSTALL: isize = 2003;
+const ID_LATER: isize = 2004;
+
+static INSTALL_EDIT: AtomicIsize = AtomicIsize::new(0);
+static INSTALL_CHOICE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn install_choice() -> &'static Mutex<Option<String>> {
+    INSTALL_CHOICE.get_or_init(|| Mutex::new(None))
+}
+
+#[repr(C)]
+struct BROWSEINFOW {
+    hwnd_owner: HWND,
+    pidl_root: isize,
+    psz_display_name: *mut u16,
+    lpsz_title: *const u16,
+    ul_flags: u32,
+    lpfn: isize,
+    l_param: LPARAM,
+    i_image: i32,
+}
+
+unsafe extern "system" {
+    fn GetWindowTextW(h_wnd: HWND, lp_string: *mut u16, n_max_count: i32) -> i32;
+    fn SetWindowTextW(h_wnd: HWND, lp_string: *const u16) -> BOOL;
+    fn SHBrowseForFolderW(lpbi: *mut BROWSEINFOW) -> isize;
+    fn SHGetPathFromIDListW(pidl: isize, psz_path: *mut u16) -> BOOL;
+}
+
+#[link(name = "ole32")]
+unsafe extern "system" {
+    fn CoInitializeEx(pv_reserved: *const std::ffi::c_void, co_init: u32) -> i32;
+    fn CoTaskMemFree(pv: *const std::ffi::c_void);
+}
+
+unsafe extern "system" fn install_dlg_proc(
+    h_wnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_COMMAND => {
+            match (w_param & 0xFFFF) as isize {
+                ID_BROWSE => {
+                    let title = to_wide("选择安装位置");
+                    let mut bi: BROWSEINFOW = std::mem::zeroed();
+                    bi.hwnd_owner = h_wnd;
+                    bi.lpsz_title = title.as_ptr();
+                    bi.ul_flags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX;
+                    let pidl = SHBrowseForFolderW(&mut bi);
+                    if pidl != 0 {
+                        let mut buf = [0u16; MAX_PATH];
+                        if SHGetPathFromIDListW(pidl, buf.as_mut_ptr()) != 0 {
+                            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                            let picked = String::from_utf16_lossy(&buf[..len]);
+                            if !picked.is_empty() {
+                                let w = to_wide(&picked);
+                                SetWindowTextW(INSTALL_EDIT.load(Ordering::Relaxed), w.as_ptr());
+                            }
+                        }
+                        CoTaskMemFree(pidl as *const std::ffi::c_void);
+                    }
+                    0
+                }
+                ID_INSTALL => {
+                    let h = INSTALL_EDIT.load(Ordering::Relaxed);
+                    let mut buf = [0u16; MAX_PATH];
+                    let n = GetWindowTextW(h, buf.as_mut_ptr(), MAX_PATH as i32);
+                    let s = if n > 0 {
+                        String::from_utf16_lossy(&buf[..(n as usize).min(MAX_PATH)])
+                    } else {
+                        String::new()
+                    };
+                    let dir = s.trim().to_string();
+                    if dir.is_empty() {
+                        show_message(
+                            "鼠标侧键切换",
+                            "请先选择安装位置（或点「浏览...」）。",
+                            MB_ICONWARNING | MB_SETFOREGROUND,
+                        );
+                        return 0;
+                    }
+                    if let Ok(mut g) = install_choice().lock() {
+                        *g = Some(dir);
+                    }
+                    DestroyWindow(h_wnd);
+                    0
+                }
+                ID_LATER => {
+                    if let Ok(mut g) = install_choice().lock() {
+                        *g = None;
+                    }
+                    DestroyWindow(h_wnd);
+                    0
+                }
+                _ => 0,
+            }
+        }
+        WM_CLOSE => {
+            DestroyWindow(h_wnd);
+            0
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            0
+        }
+        _ => DefWindowProcW(h_wnd, msg, w_param, l_param),
+    }
+}
+
+/// 弹出「尚未加入开机启动」安装框，返回用户选择的安装目录（None = 以后再说）。
+fn ask_install_location(default: &str) -> Option<String> {
+    const W: i32 = 500;
+    const H: i32 = 264;
+
+    unsafe {
+        // SHBrowseForFolderW 需要 COM 初始化
+        let _ = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED);
+
+        let class_name = to_wide("MouseSideKeysInstallClass");
+        let mut wc: WNDCLASSW = std::mem::zeroed();
+        wc.lpfn_wnd_proc = Some(install_dlg_proc);
+        wc.h_instance = 0;
+        wc.h_cursor = 0;
+        wc.h_icon = 0;
+        wc.h_brush_background = 16;
+        wc.lpsz_class_name = class_name.as_ptr();
+        let _ = RegisterClassW(&wc);
+
+        let title = to_wide("鼠标侧键切换 —— 安装到开机启动");
+        let line1 = to_wide("尚未加入开机启动。请选择安装位置，程序会把自己复制过去，");
+        let line2 = to_wide("并注册为开机启动任务（最高权限运行，避免侧键被系统拦截）。");
+        let line3 = to_wide("安装完成后会自动从新位置启动一次；以后开机即自动运行。");
+        let b_browse = to_wide("浏览...");
+        let b_install = to_wide("安装并启动");
+        let b_later = to_wide("以后再说");
+        let default_w = to_wide(default);
+
+        let sx = GetSystemMetrics(SM_CXSCREEN);
+        let sy = GetSystemMetrics(SM_CYSCREEN);
+        let x = if sx > W { (sx - W) / 2 } else { 0 };
+        let y = if sy > H { (sy - H) / 2 } else { 0 };
+
+        let hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
+            class_name.as_ptr(),
+            title.as_ptr(),
+            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_DLGFRAME,
+            x,
+            y,
+            W,
+            H,
+            0,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        if hwnd == 0 {
+            return None;
+        }
+
+        let font = GetStockObject(DEFAULT_GUI_FONT);
+        let static_cls = to_wide("Static");
+        let button_cls = to_wide("Button");
+        let edit_cls = to_wide("Edit");
+
+        let mk_static = |text: *const u16, y: i32, h: i32| -> HWND {
+            let h1 = CreateWindowExW(
+                0,
+                static_cls.as_ptr(),
+                text,
+                WS_CHILD | WS_VISIBLE,
+                24,
+                y,
+                452,
+                h,
+                hwnd,
+                0,
+                0,
+                std::ptr::null(),
+            );
+            SendMessageW(h1, WM_SETFONT, font as WPARAM, 1);
+            h1
+        };
+        let mk_button = |text: *const u16, x: i32, y: i32, w: i32, h: i32, id: isize, def: bool| -> HWND {
+            let st = WS_CHILD | WS_VISIBLE | WS_TABSTOP | (if def { BS_DEFPUSHBUTTON } else { 0 });
+            let h1 = CreateWindowExW(
+                0,
+                button_cls.as_ptr(),
+                text,
+                st,
+                x,
+                y,
+                w,
+                h,
+                hwnd,
+                id,
+                0,
+                std::ptr::null(),
+            );
+            SendMessageW(h1, WM_SETFONT, font as WPARAM, 1);
+            h1
+        };
+
+        mk_static(line1.as_ptr(), 16, 20);
+        mk_static(line2.as_ptr(), 38, 20);
+        mk_static(line3.as_ptr(), 186, 20);
+
+        let h_edit = CreateWindowExW(
+            0,
+            edit_cls.as_ptr(),
+            default_w.as_ptr(),
+            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            24,
+            78,
+            372,
+            26,
+            hwnd,
+            ID_EDIT,
+            0,
+            std::ptr::null(),
+        );
+        SendMessageW(h_edit, WM_SETFONT, font as WPARAM, 1);
+        INSTALL_EDIT.store(h_edit, Ordering::Relaxed);
+
+        mk_button(b_browse.as_ptr(), 404, 77, 72, 28, ID_BROWSE, false);
+        let h_install = mk_button(b_install.as_ptr(), 132, 132, 124, 34, ID_INSTALL, true);
+        mk_button(b_later.as_ptr(), 264, 132, 96, 34, ID_LATER, false);
+
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetFocus(h_install);
+
+        modal_loop();
+    }
+
+    install_choice().lock().ok().and_then(|mut g| g.take())
+}
+
+// --------------------------------------------------------------------------
 // 预设 / 自检 / 列表
 // --------------------------------------------------------------------------
 fn preset_params(name: &str) -> (bool, bool, u64, u64) {
@@ -1206,6 +1632,23 @@ fn main() {
 
     CONFIG.get_or_init(|| cfg);
 
+    // 安装模式（--install <目录>）：由提权后的实例执行，完成后直接退出。
+    if let Some(dir) = parse_install_arg() {
+        if integrity_level(None).unwrap_or(0) < 0x3000 {
+            // 注册 RunLevel=HIGHEST 的计划任务必须管理员权限
+            if relaunch_elevated_with(&format!("--install \"{}\"", dir)) {
+                out("安装需要管理员权限，已请求提权（请在 UAC 弹窗中确认）。\n");
+            } else {
+                out("[错误] 提权被取消或失败，无法注册开机启动。\n");
+            }
+            finish_output();
+            return;
+        }
+        do_install(&dir);
+        finish_output();
+        return;
+    }
+
     if elevate {
         if integrity_level(None).unwrap_or(0) >= 0x3000 {
             out("当前已是管理员权限，无需提权。\n");
@@ -1222,6 +1665,34 @@ fn main() {
         cmd_test(&preset);
         finish_output();
         return;
+    }
+
+    // 开机启动：还没注册过就引导安装（复制自己到目标目录 + 注册最高权限计划任务）。
+    // 放在单实例检查之前：安装动作本身不该被「已有实例在跑」挡住。
+    if !startup_task_registered() && !install_skipped() {
+        if has_console() {
+            // 从终端启动：只提示，不弹窗打扰脚本场景
+            out("提示：尚未加入开机启动。可用 --install <目录> 安装（需管理员权限）。\n");
+        } else {
+            match ask_install_location(&default_install_dir()) {
+                Some(dir) => {
+                    if integrity_level(None).unwrap_or(0) >= 0x3000 {
+                        // 已经是管理员，直接装
+                        do_install(&dir);
+                    } else if relaunch_elevated_with(&format!("--install \"{}\"", dir)) {
+                        out("安装需要管理员权限，已请求提权（请在 UAC 弹窗中确认）。\n");
+                    } else {
+                        out("[错误] 提权被取消或失败，未安装开机启动。\n");
+                    }
+                    finish_output();
+                    return;
+                }
+                None => {
+                    // 用户选了「以后再说」：写个标记，之后不再每次启动都弹
+                    mark_install_skipped();
+                }
+            }
+        }
     }
 
     // 单实例：先看有没有已经在跑的实例。
