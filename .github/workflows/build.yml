@@ -1,0 +1,75 @@
+name: build
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows x64 exe
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable (msvc)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            mouse-side-keys-rs/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('mouse-side-keys-rs/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Capture the full compiler output to build.log so it can be read back
+      # without needing an authenticated API call (log is published later).
+      - name: cargo build --release
+        working-directory: mouse-side-keys-rs
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --release 2>&1 | tee build.log
+
+      # Publish build.log (always) and the built exe (on success) to a dedicated
+      # branch. The repo is public, so raw.githubusercontent.com serves these
+      # files anonymously -- this replaces the need for a PAT to read logs or
+      # download artifacts.
+      - name: Publish log and exe to build-output branch
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "actions-bot"
+          git config user.email "actions-bot@users.noreply.github.com"
+          git checkout -B build-output
+
+          if [ -f mouse-side-keys-rs/build.log ]; then
+            cp mouse-side-keys-rs/build.log build.log
+          fi
+
+          # 用 glob 而不是 `ls | head`：GitHub 的 bash 默认带 -e -o pipefail，
+          # 没有 exe 时 `ls` 失败会让整条管道失败并中断整个步骤。
+          EXE=""
+          for f in mouse-side-keys-rs/target/release/*.exe; do
+            if [ -f "$f" ]; then EXE="$f"; break; fi
+          done
+          if [ -n "$EXE" ]; then
+            cp "$EXE" mouse-side-keys-rs.exe
+          fi
+
+          if [ -f build.log ]; then git add -f build.log; fi
+          if [ -f mouse-side-keys-rs.exe ]; then git add -f mouse-side-keys-rs.exe; fi
+
+          git -c commit.gpgsign=false commit -m "build output $(date -u +%Y%m%dT%H%M%SZ)" || echo "nothing to commit"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" build-output

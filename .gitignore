@@ -1,5 +1,4 @@
+# 注意：不要忽略 .github/ —— 里面是 GitHub Actions 的 workflow 定义，
+# 忽略掉的话 workflow 提交不上去，push 就不会触发远端构建。
 # Rust build output
-mouse-side-keys-rs/target/
-
-.github
 .workbuddy
