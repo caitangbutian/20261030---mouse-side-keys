@@ -1147,8 +1147,8 @@ fn create_main_window() -> HWND {
         let help2 = to_wide("若 '状态： 已停止' 关闭窗口即退出程序");
         let help3 = to_wide("开机自启时后台运行，不显示界面。");
 
-        const W: i32 = 440;
-        const H: i32 = 300;
+        const W: i32 = 420;
+        const H: i32 = 234;
         let sx = GetSystemMetrics(SM_CXSCREEN);
         let sy = GetSystemMetrics(SM_CYSCREEN);
         let x = if sx > W { (sx - W) / 2 } else { 0 };
@@ -1207,36 +1207,36 @@ fn create_main_window() -> HWND {
             static_cls.as_ptr(),
             status0.as_ptr(),
             0,
-            24,
-            24,
+            18,
+            18,
             384,
-            24,
+            22,
             ID_STATUS,
         );
-        mk(static_cls.as_ptr(), mapping.as_ptr(), 0, 24, 56, 384, 20, 0);
+        mk(static_cls.as_ptr(), mapping.as_ptr(), 0, 18, 48, 384, 20, 0);
         let h_toggle = mk(
             button_cls.as_ptr(),
             b_start.as_ptr(),
             WS_TABSTOP,
-            24,
-            92,
+            18,
+            82,
             120,
-            34,
+            32,
             ID_TOGGLE,
         );
         let h_auto = mk(
             button_cls.as_ptr(),
             b_auto.as_ptr(),
             WS_TABSTOP | BS_AUTOCHECKBOX,
-            24,
-            148,
+            18,
+            124,
             384,
-            24,
+            22,
             ID_AUTOSTART,
         );
-        mk(static_cls.as_ptr(), help1.as_ptr(), 0, 24, 196, 384, 20, 0);
-        mk(static_cls.as_ptr(), help2.as_ptr(), 0, 24, 222, 384, 20, 0);
-        mk(static_cls.as_ptr(), help3.as_ptr(), 0, 24, 248, 384, 20, 0);
+        mk(static_cls.as_ptr(), help1.as_ptr(), 0, 18, 156, 384, 16, 0);
+        mk(static_cls.as_ptr(), help2.as_ptr(), 0, 18, 178, 384, 16, 0);
+        mk(static_cls.as_ptr(), help3.as_ptr(), 0, 18, 200, 384, 16, 0);
 
         H_STATUS.store(h_status, Ordering::Relaxed);
         H_TOGGLE.store(h_toggle, Ordering::Relaxed);
