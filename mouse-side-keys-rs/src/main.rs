@@ -974,7 +974,6 @@ fn install_ctrl_handler() {
 
 const MAIN_CLASS: &str = "MouseSideKeysMainClass";
 const ID_TOGGLE: isize = 3001;
-const ID_EXIT: isize = 3002;
 const ID_AUTOSTART: isize = 3003;
 const ID_STATUS: isize = 3004;
 
@@ -989,10 +988,8 @@ static HOOK: AtomicIsize = AtomicIsize::new(0);
 static H_STATUS: AtomicIsize = AtomicIsize::new(0);
 static H_TOGGLE: AtomicIsize = AtomicIsize::new(0);
 static H_AUTOSTART: AtomicIsize = AtomicIsize::new(0);
-/// 主界面窗口句柄（后台模式下为 0，直到用户从托盘打开界面）
+/// 主界面窗口句柄（后台/无界面时为 0，直到被重新打开）
 static H_MAIN: AtomicIsize = AtomicIsize::new(0);
-/// 后台模式下那个不可见窗口的句柄（托盘图标依附于它）
-static H_BG: AtomicIsize = AtomicIsize::new(0);
 
 unsafe extern "system" {
     fn FindWindowW(lp_class_name: *const u16, lp_window_name: *const u16) -> HWND;
@@ -1030,28 +1027,17 @@ fn stop_hook() {
     remove_pid_file();
 }
 
-/// 已经有一个实例在跑时，把它的界面叫到前台。返回是否找到了那个实例。
+/// 已经有一个实例在跑时，把它的界面叫到前台（或重新打开）。返回是否找到了那个实例。
 ///
-/// 两种形态都要覆盖：
-///   1. 界面实例 —— 主窗口类名 MAIN_CLASS，ShowWindow 置前即可；
-///   2. 后台实例（开机自启）—— 没有主窗口，只有一个不可见的托盘窗口，
-///      给它发一条「打开界面」消息，让**已经在跑的那个进程**把界面显示出来。
-///      这样双击 exe 就能唤出界面，而不是弹「已在运行」让用户二选一。
+/// 任何形态（界面开着 / 关闭后后台运行 / 开机自启无界面）都共用同一个消息专用
+/// 「锚点窗口」：找到它并发送 WM_APP_SHOW_MAIN，由**已经在跑的那个进程**把主界面
+/// 显示出来。这样双击 exe 永远只是「唤出界面」，不会二选一或开第二个。
 fn activate_existing_window() -> bool {
-    let cls = to_wide(MAIN_CLASS);
+    let cls = to_wide(ANCHOR_CLASS);
     unsafe {
         let h = FindWindowW(cls.as_ptr(), std::ptr::null());
         if h != 0 {
-            let _ = ShowWindow(h, SW_RESTORE);
-            let _ = SetForegroundWindow(h);
-            return true;
-        }
-    }
-    let bg = to_wide(BG_CLASS);
-    unsafe {
-        let h = FindWindowW(bg.as_ptr(), std::ptr::null());
-        if h != 0 {
-            let _ = SendMessageW(h, WM_TRAY, 0, WM_LBUTTONDBLCLK as LPARAM);
+            let _ = SendMessageW(h, WM_APP_SHOW_MAIN, 0, 0);
             return true;
         }
     }
@@ -1094,7 +1080,6 @@ unsafe extern "system" fn main_wnd_proc(
                     );
                 }
                 refresh_ui();
-                update_tray_icon();
                 0
             } else if id == ID_AUTOSTART {
                 let want =
@@ -1124,16 +1109,11 @@ unsafe extern "system" fn main_wnd_proc(
         WM_DESTROY => {
             H_MAIN.store(0, Ordering::Relaxed);
             if hook_running() {
-                // 运行中关闭窗口 → 转后台：隐藏界面、保持运行，并确保托盘图标存在
-                // （这样用户仍能从托盘打开界面 / 停止 / 退出）
-                ensure_background();
+                // 运行中关闭窗口 → 直接销毁窗口，钩子继续在后台跑（无窗口、无托盘），
+                // 程序保持存活。需要再次操作时双击 exe 即可重新唤出界面。
                 0
             } else {
                 // 已停止关闭窗口 → 退出整个程序
-                let hb = H_BG.load(Ordering::Relaxed);
-                if hb != 0 {
-                    remove_tray_icon(hb);
-                }
                 stop_hook();
                 PostQuitMessage(0);
                 0
@@ -1279,6 +1259,7 @@ fn ui_main() {
         let tid = GetCurrentThreadId();
         MAIN_TID.store(tid, Ordering::Relaxed);
         install_ctrl_handler();
+        ensure_anchor();
 
         if create_main_window() == 0 {
             show_message(
@@ -1294,17 +1275,15 @@ fn ui_main() {
 }
 
 /// 后台静默模式（--background，开机自启时走这里）：
-/// 不创建任何可见窗口，直接装好钩子让侧键生效；只在通知区放一个托盘图标，
-/// 作为唯一的可见出口（否则后台跑起来后用户无从打开界面 / 停止 / 退出）。
+/// 不创建任何可见窗口、也不放托盘图标，直接装好钩子让侧键生效。
+/// 仅保留一个不可见的「锚点窗口」用于单实例重新打开界面。
+/// 需要操作时双击 exe 即可唤出界面（启动 / 停止 / 退出）。
 fn background_main() {
     unsafe {
         let tid = GetCurrentThreadId();
         MAIN_TID.store(tid, Ordering::Relaxed);
         install_ctrl_handler();
-
-        // 不可见窗口 + 托盘图标：托盘需要一个窗口来接收回调消息
-        ensure_background();
-        let hwnd = H_BG.load(Ordering::Relaxed);
+        ensure_anchor();
 
         if !start_hook() {
             // 后台没有界面可以提示，记到输出缓冲即可（不会弹窗打扰）
@@ -1312,8 +1291,6 @@ fn background_main() {
         }
 
         message_loop();
-
-        remove_tray_icon(hwnd);
     }
     stop_hook();
 }
@@ -1338,79 +1315,17 @@ fn message_loop() {
 }
 
 // --------------------------------------------------------------------------
-// 通知区（托盘）图标 —— 后台模式的唯一出口
+// 锚点窗口 —— 单实例重新打开界面的消息入口（无界面、无托盘）
 // --------------------------------------------------------------------------
 
-const BG_CLASS: &str = "MouseSideKeysBgClass";
-const WM_TRAY: u32 = 0x8002; // WM_APP + 2：托盘回调消息
-const TRAY_ID: u32 = 1;
-
-const NIM_ADD: u32 = 0;
-const NIM_MODIFY: u32 = 1;
-const NIM_DELETE: u32 = 2;
-const NIF_MESSAGE: u32 = 0x0000_0001;
-const NIF_ICON: u32 = 0x0000_0002;
-const NIF_TIP: u32 = 0x0000_0004;
+// 消息专用锚点窗口：不可见、不进任务栏、无托盘，仅用于单实例重新打开界面。
+const ANCHOR_CLASS: &str = "MouseSideKeysAnchor";
+const HWND_MESSAGE: isize = -3; // 消息专用窗口的父句柄（HWND_MESSAGE）
+const WM_APP_SHOW_MAIN: u32 = 0x8003; // WM_APP + 3：让后台实例把主界面打开
 const IDI_APPLICATION: usize = 32512;
-
-const WM_LBUTTONDBLCLK: u32 = 0x0203;
-const WM_RBUTTONUP: u32 = 0x0205;
-
-const MENU_OPEN: usize = 1;
-const MENU_TOGGLE: usize = 2;
-const MENU_EXIT: usize = 3;
-
-const MF_STRING: u32 = 0x0000_0000;
-const TPM_RIGHTBUTTON: u32 = 0x0002;
-const TPM_RETURNCMD: u32 = 0x0100;
-
-#[repr(C)]
-struct POINT {
-    x: i32,
-    y: i32,
-}
-
-#[repr(C)]
-struct NOTIFYICONDATAW {
-    cb_size: u32,
-    h_wnd: HWND,
-    u_id: u32,
-    u_flags: u32,
-    u_callback_message: u32,
-    h_icon: HANDLE,
-    sz_tip: [u16; 128],
-    dw_state: u32,
-    dw_state_mask: u32,
-    sz_info: [u16; 256],
-    u_version: u32,
-    sz_info_title: [u16; 64],
-    dw_info_flags: u32,
-    guid_item: [u32; 4],
-    h_balloon_icon: HANDLE,
-}
-
-// Shell_NotifyIconW 在 shell32（ShellExecuteW 已把 shell32 带进链接，这里显式声明更稳）
-#[link(name = "shell32")]
-unsafe extern "system" {
-    fn Shell_NotifyIconW(dw_message: u32, lp_data: *const NOTIFYICONDATAW) -> BOOL;
-}
 
 unsafe extern "system" {
     fn LoadIconW(h_instance: HINSTANCE, lp_icon_name: *const u16) -> HANDLE;
-    fn CreatePopupMenu() -> isize;
-    fn AppendMenuW(h_menu: isize, u_flags: u32, u_id_new_item: usize, lp_new_item: *const u16)
-        -> BOOL;
-    fn TrackPopupMenu(
-        h_menu: isize,
-        u_flags: u32,
-        x: i32,
-        y: i32,
-        n_reserved: i32,
-        h_wnd: HWND,
-        prc_rect: *const std::ffi::c_void,
-    ) -> BOOL;
-    fn DestroyMenu(h_menu: isize) -> BOOL;
-    fn GetCursorPos(lp_point: *mut POINT) -> BOOL;
 }
 
 /// 加载编译进 exe 的鼠标图标（资源 id = 1，由 build.rs 通过 winresource 嵌入）。
@@ -1426,68 +1341,25 @@ fn app_icon() -> HANDLE {
     }
 }
 
-fn tray_data(h_wnd: HWND, tip: &str) -> NOTIFYICONDATAW {
-    let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
-    nid.cb_size = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-    nid.h_wnd = h_wnd;
-    nid.u_id = TRAY_ID;
-    nid.u_flags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    nid.u_callback_message = WM_TRAY;
-    nid.h_icon = app_icon();
-    let t = to_wide(tip);
-    let n = t.len().min(nid.sz_tip.len());
-    nid.sz_tip[..n].copy_from_slice(&t[..n]);
-    nid
-}
+/// 锚点窗口句柄（消息专用、不可见、无托盘）。
+static H_ANCHOR: AtomicIsize = AtomicIsize::new(0);
 
-fn add_tray_icon(h_wnd: HWND) {
-    let tip = if hook_running() {
-        "鼠标侧键切换 - 运行中"
-    } else {
-        "鼠标侧键切换 - 已停止"
-    };
-    let nid = tray_data(h_wnd, tip);
-    unsafe {
-        let _ = Shell_NotifyIconW(NIM_ADD, &nid);
-    }
-}
-
-fn update_tray_icon() {
-    let h = H_BG.load(Ordering::Relaxed);
-    if h == 0 {
-        return;
-    }
-    let tip = if hook_running() {
-        "鼠标侧键切换 - 运行中"
-    } else {
-        "鼠标侧键切换 - 已停止"
-    };
-    let nid = tray_data(h, tip);
-    unsafe {
-        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
-    }
-}
-
-fn remove_tray_icon(h_wnd: HWND) {
-    let nid = tray_data(h_wnd, "");
-    unsafe {
-        let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
-    }
-}
-
-/// 确保「后台窗口 + 托盘图标」存在（仅首次创建）。
-/// 普通界面实例在「运行中关闭窗口」时也需要转后台，所以和开机自启共用同一套。
-fn ensure_background() {
-    if H_BG.load(Ordering::Relaxed) != 0 {
+/// 确保「锚点窗口」存在（仅首次创建）。
+/// 锚点是一个消息专用窗口（父为 HWND_MESSAGE），完全不可见、不进任务栏、无托盘，
+/// 仅用于：① 单实例的第二个 exe 通过 FindWindowW 找到正在运行的实例；
+/// ② 接收 WM_APP_SHOW_MAIN 把主界面重新打开。
+/// 这样「关闭窗口但保留后台功能」时程序仍能存活并被重新唤出，且没有任何可见残留。
+fn ensure_anchor() {
+    if H_ANCHOR.load(Ordering::Relaxed) != 0 {
         return;
     }
     unsafe {
-        let cls = to_wide(BG_CLASS);
+        let cls = to_wide(ANCHOR_CLASS);
         let mut wc: WNDCLASSW = std::mem::zeroed();
-        wc.lpfn_wnd_proc = Some(bg_wnd_proc);
+        wc.lpfn_wnd_proc = Some(anchor_wnd_proc);
         wc.h_instance = 0;
         wc.h_cursor = 0;
-        wc.h_icon = app_icon();
+        wc.h_icon = 0;
         wc.h_brush_background = 16;
         wc.lpsz_class_name = cls.as_ptr();
         let _ = RegisterClassW(&wc);
@@ -1495,79 +1367,41 @@ fn ensure_background() {
             0,
             cls.as_ptr(),
             cls.as_ptr(),
-            0, // 无 WS_VISIBLE：完全不可见
             0,
             0,
             0,
             0,
             0,
+            HWND_MESSAGE,
             0,
             0,
             std::ptr::null(),
         );
-        H_BG.store(hwnd, Ordering::Relaxed);
-        add_tray_icon(hwnd);
+        H_ANCHOR.store(hwnd, Ordering::Relaxed);
     }
 }
 
-/// 托盘菜单：打开界面 / 启动(停止)切换 / 退出
-fn show_tray_menu(h_wnd: HWND) {
-    unsafe {
-        let mut pt: POINT = std::mem::zeroed();
-        if GetCursorPos(&mut pt) == 0 {
-            return;
+unsafe extern "system" fn anchor_wnd_proc(
+    h_wnd: HWND,
+    msg: u32,
+    _w_param: WPARAM,
+    _l_param: LPARAM,
+) -> LRESULT {
+    if msg == WM_APP_SHOW_MAIN {
+        // 第二个实例请求打开界面：已有的（或新建的）主界面会显示到前台
+        open_main_window();
+        return 0;
+    }
+    match msg {
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            0
         }
-        let m = CreatePopupMenu();
-        if m == 0 {
-            return;
-        }
-        let t_open = to_wide("打开界面");
-        let t_toggle = to_wide(if hook_running() { "停止切换" } else { "启动切换" });
-        let t_exit = to_wide("退出");
-        let _ = AppendMenuW(m, MF_STRING, MENU_OPEN, t_open.as_ptr());
-        let _ = AppendMenuW(m, MF_STRING, MENU_TOGGLE, t_toggle.as_ptr());
-        let _ = AppendMenuW(m, MF_STRING, MENU_EXIT, t_exit.as_ptr());
-
-        // 托盘菜单的常规套路：先把自己置前，否则点空白处菜单不消失
-        let _ = SetForegroundWindow(h_wnd);
-        let cmd = TrackPopupMenu(
-            m,
-            TPM_RIGHTBUTTON | TPM_RETURNCMD,
-            pt.x,
-            pt.y,
-            0,
-            h_wnd,
-            std::ptr::null(),
-        );
-        let _ = DestroyMenu(m);
-
-        match cmd as usize {
-            MENU_OPEN => open_main_window(),
-            MENU_TOGGLE => {
-                if hook_running() {
-                    stop_hook();
-                } else if !start_hook() {
-                    show_message(
-                        "鼠标侧键切换",
-                        "启动失败：无法安装鼠标钩子。",
-                        MB_ICONWARNING | MB_SETFOREGROUND,
-                    );
-                }
-                refresh_ui();
-                update_tray_icon();
-            }
-            MENU_EXIT => {
-                // 从托盘退出：整个程序结束（后台实例也一起没了）
-                remove_tray_icon(h_wnd);
-                stop_hook();
-                PostQuitMessage(0);
-            }
-            _ => {}
-        }
+        _ => DefWindowProcW(h_wnd, msg, _w_param, _l_param),
     }
 }
 
-/// 后台模式下把主界面叫出来（已打开则置前，没打开则新建）。
+/// 把主界面叫出来（已打开则置前，没打开则新建）。
 fn open_main_window() {
     unsafe {
         let h = H_MAIN.load(Ordering::Relaxed);
@@ -1583,30 +1417,6 @@ fn open_main_window() {
             let _ = SetForegroundWindow(h);
             refresh_ui();
         }
-    }
-}
-
-unsafe extern "system" fn bg_wnd_proc(
-    h_wnd: HWND,
-    msg: u32,
-    w_param: WPARAM,
-    l_param: LPARAM,
-) -> LRESULT {
-    if msg == WM_TRAY {
-        let ev = (l_param as u32) & 0xFFFF;
-        if ev == WM_LBUTTONDBLCLK {
-            open_main_window();
-        } else if ev == WM_RBUTTONUP {
-            show_tray_menu(h_wnd);
-        }
-        return 0;
-    }
-    match msg {
-        WM_DESTROY => {
-            PostQuitMessage(0);
-            0
-        }
-        _ => DefWindowProcW(h_wnd, msg, w_param, l_param),
     }
 }
 
@@ -1943,7 +1753,7 @@ fn main() {
     CONFIG.get_or_init(|| cfg);
 
     // --background：后台静默模式。由开机启动的计划任务传入，
-    // 不显示任何界面，直接让侧键生效（托盘图标是唯一入口）。
+    // 不显示任何界面、也不放托盘图标，直接让侧键生效（锚点窗口仅用于重新打开界面）。
     let background = std::env::args().any(|a| a == "--background");
     BACKGROUND.store(background, Ordering::Relaxed);
 
