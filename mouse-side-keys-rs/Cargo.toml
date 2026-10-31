@@ -19,6 +19,10 @@ windows-sys = { version = "0.52", features = [
     "Win32_Security",
 ] }
 
+[build-dependencies]
+# 仅 Windows 下用于把 .ico 图标编进 exe 资源（run 在 GitHub Actions 的 windows-latest，有网可拉取）。
+winresource = "0.1"
+
 [profile.release]
 # 体积与资源优先：最高压缩优化 + 全程序 LTO + 剥符号表 + 关闭 unwind 栈展开。
 opt-level = "z"

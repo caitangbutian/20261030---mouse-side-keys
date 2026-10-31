@@ -1155,7 +1155,7 @@ fn create_main_window() -> HWND {
         wc.lpfn_wnd_proc = Some(main_wnd_proc);
         wc.h_instance = 0;
         wc.h_cursor = 0;
-        wc.h_icon = 0;
+        wc.h_icon = app_icon();
         wc.h_brush_background = 16;
         wc.lpsz_class_name = class_name.as_ptr();
         let _ = RegisterClassW(&wc);
@@ -1324,7 +1324,7 @@ fn background_main() {
         wc.lpfn_wnd_proc = Some(bg_wnd_proc);
         wc.h_instance = 0;
         wc.h_cursor = 0;
-        wc.h_icon = 0;
+        wc.h_icon = app_icon();
         wc.h_brush_background = 16;
         wc.lpsz_class_name = cls.as_ptr();
         let _ = RegisterClassW(&wc);
@@ -1436,6 +1436,19 @@ unsafe extern "system" {
 
 unsafe extern "system" {
     fn LoadIconW(h_instance: HINSTANCE, lp_icon_name: *const u16) -> HANDLE;
+
+/// 加载编译进 exe 的鼠标图标（资源 id = 1，由 build.rs 通过 winresource 嵌入）。
+/// 加载失败时回退到系统默认应用图标，不影响功能。
+fn app_icon() -> HANDLE {
+    unsafe {
+        let h = LoadIconW(GetModuleHandleW(std::ptr::null()), 1 as *const u16);
+        if h == 0 {
+            LoadIconW(0, IDI_APPLICATION as *const u16)
+        } else {
+            h
+        }
+    }
+}
     fn CreatePopupMenu() -> isize;
     fn AppendMenuW(h_menu: isize, u_flags: u32, u_id_new_item: usize, lp_new_item: *const u16)
         -> BOOL;
@@ -1459,7 +1472,7 @@ fn tray_data(h_wnd: HWND, tip: &str) -> NOTIFYICONDATAW {
     nid.u_id = TRAY_ID;
     nid.u_flags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.u_callback_message = WM_TRAY;
-    nid.h_icon = unsafe { LoadIconW(0, IDI_APPLICATION as *const u16) };
+    nid.h_icon = app_icon();
     let t = to_wide(tip);
     let n = t.len().min(nid.sz_tip.len());
     nid.sz_tip[..n].copy_from_slice(&t[..n]);
