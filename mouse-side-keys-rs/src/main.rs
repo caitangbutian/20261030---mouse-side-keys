@@ -1436,19 +1436,6 @@ unsafe extern "system" {
 
 unsafe extern "system" {
     fn LoadIconW(h_instance: HINSTANCE, lp_icon_name: *const u16) -> HANDLE;
-
-/// 加载编译进 exe 的鼠标图标（资源 id = 1，由 build.rs 通过 winresource 嵌入）。
-/// 加载失败时回退到系统默认应用图标，不影响功能。
-fn app_icon() -> HANDLE {
-    unsafe {
-        let h = LoadIconW(GetModuleHandleW(std::ptr::null()), 1 as *const u16);
-        if h == 0 {
-            LoadIconW(0, IDI_APPLICATION as *const u16)
-        } else {
-            h
-        }
-    }
-}
     fn CreatePopupMenu() -> isize;
     fn AppendMenuW(h_menu: isize, u_flags: u32, u_id_new_item: usize, lp_new_item: *const u16)
         -> BOOL;
@@ -1463,6 +1450,19 @@ fn app_icon() -> HANDLE {
     ) -> BOOL;
     fn DestroyMenu(h_menu: isize) -> BOOL;
     fn GetCursorPos(lp_point: *mut POINT) -> BOOL;
+}
+
+/// 加载编译进 exe 的鼠标图标（资源 id = 1，由 build.rs 通过 winresource 嵌入）。
+/// 加载失败时回退到系统默认应用图标，不影响功能。
+fn app_icon() -> HANDLE {
+    unsafe {
+        let h = LoadIconW(GetModuleHandleW(std::ptr::null()), 1 as *const u16);
+        if h == 0 {
+            LoadIconW(0, IDI_APPLICATION as *const u16)
+        } else {
+            h
+        }
+    }
 }
 
 fn tray_data(h_wnd: HWND, tip: &str) -> NOTIFYICONDATAW {
