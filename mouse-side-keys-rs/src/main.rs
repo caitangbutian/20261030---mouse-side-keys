@@ -1066,7 +1066,7 @@ fn refresh_ui() {
         return;
     }
     let running = hook_running();
-    let txt = to_wide(if running { "状态：运行中" } else { "状态：未运行" });
+    let txt = to_wide(if running { "状态： 运行中" } else { "状态： 已停止" });
     let btn = to_wide(if running { "停止" } else { "启动" });
     unsafe {
         SetWindowTextW(H_STATUS.load(Ordering::Relaxed), txt.as_ptr());
@@ -1113,15 +1113,6 @@ unsafe extern "system" fn main_wnd_proc(
                     );
                 }
                 0
-            } else if id == ID_EXIT {
-                DestroyWindow(h_wnd);
-                if in_background() {
-                    // 后台模式下关闭界面只是隐藏，所以「退出」要显式结束整个程序
-                    remove_tray_icon(H_BG.load(Ordering::Relaxed));
-                    stop_hook();
-                    PostQuitMessage(0);
-                }
-                0
             } else {
                 0
             }
@@ -1132,10 +1123,17 @@ unsafe extern "system" fn main_wnd_proc(
         }
         WM_DESTROY => {
             H_MAIN.store(0, Ordering::Relaxed);
-            if in_background() {
-                // 后台模式：只关掉界面，程序继续在托盘后面跑
+            if hook_running() {
+                // 运行中关闭窗口 → 转后台：隐藏界面、保持运行，并确保托盘图标存在
+                // （这样用户仍能从托盘打开界面 / 停止 / 退出）
+                ensure_background();
                 0
             } else {
+                // 已停止关闭窗口 → 退出整个程序
+                let hb = H_BG.load(Ordering::Relaxed);
+                if hb != 0 {
+                    remove_tray_icon(hb);
+                }
                 stop_hook();
                 PostQuitMessage(0);
                 0
@@ -1160,21 +1158,17 @@ fn create_main_window() -> HWND {
         wc.lpsz_class_name = class_name.as_ptr();
         let _ = RegisterClassW(&wc);
 
-        let title = to_wide("鼠标侧键切换");
-        let line1 = to_wide("用鼠标侧键切换 Windows 虚拟桌面");
-        let line2 = to_wide("侧键1 -> Ctrl+Win+右；侧键2 -> Ctrl+Win+左");
-        let line3 = to_wide("关闭本窗口即退出；开机自启时后台运行，不显示界面。");
-        let level_txt = to_wide(&format!(
-            "权限级别：{}",
-            describe_level(integrity_level(None).unwrap_or(0))
-        ));
-        let status0 = to_wide(if hook_running() { "状态：运行中" } else { "状态：未运行" });
+        let title = to_wide("用鼠标侧键切换Windows桌面");
+        let status0 = to_wide(if hook_running() { "状态： 运行中" } else { "状态： 已停止" });
+        let mapping = to_wide("侧键1->Ctrl+Win+右；侧键2->Ctrl+Win+左");
         let b_start = to_wide(if hook_running() { "停止" } else { "启动" });
-        let b_exit = to_wide("退出");
         let b_auto = to_wide("开机自动启动（管理员权限运行）");
+        let help1 = to_wide("若 '状态： 运行中' 关闭窗口即后台运行");
+        let help2 = to_wide("若 '状态： 已停止' 关闭窗口即退出程序");
+        let help3 = to_wide("开机自启时后台运行，不显示界面。");
 
         const W: i32 = 440;
-        const H: i32 = 340;
+        const H: i32 = 300;
         let sx = GetSystemMetrics(SM_CXSCREEN);
         let sy = GetSystemMetrics(SM_CYSCREEN);
         let x = if sx > W { (sx - W) / 2 } else { 0 };
@@ -1229,23 +1223,23 @@ fn create_main_window() -> HWND {
             h1
         };
 
-        mk(static_cls.as_ptr(), line1.as_ptr(), 0, 24, 20, 384, 20, 0);
         let h_status = mk(
             static_cls.as_ptr(),
             status0.as_ptr(),
             0,
             24,
-            48,
+            24,
             384,
-            20,
+            24,
             ID_STATUS,
         );
+        mk(static_cls.as_ptr(), mapping.as_ptr(), 0, 24, 56, 384, 20, 0);
         let h_toggle = mk(
             button_cls.as_ptr(),
             b_start.as_ptr(),
             WS_TABSTOP,
             24,
-            80,
+            92,
             120,
             34,
             ID_TOGGLE,
@@ -1255,24 +1249,14 @@ fn create_main_window() -> HWND {
             b_auto.as_ptr(),
             WS_TABSTOP | BS_AUTOCHECKBOX,
             24,
-            132,
+            148,
             384,
             24,
             ID_AUTOSTART,
         );
-        mk(
-            button_cls.as_ptr(),
-            b_exit.as_ptr(),
-            WS_TABSTOP,
-            24,
-            176,
-            120,
-            34,
-            ID_EXIT,
-        );
-        mk(static_cls.as_ptr(), line2.as_ptr(), 0, 24, 226, 384, 20, 0);
-        mk(static_cls.as_ptr(), line3.as_ptr(), 0, 24, 250, 384, 20, 0);
-        mk(static_cls.as_ptr(), level_txt.as_ptr(), 0, 24, 274, 384, 20, 0);
+        mk(static_cls.as_ptr(), help1.as_ptr(), 0, 24, 196, 384, 20, 0);
+        mk(static_cls.as_ptr(), help2.as_ptr(), 0, 24, 222, 384, 20, 0);
+        mk(static_cls.as_ptr(), help3.as_ptr(), 0, 24, 248, 384, 20, 0);
 
         H_STATUS.store(h_status, Ordering::Relaxed);
         H_TOGGLE.store(h_toggle, Ordering::Relaxed);
@@ -1318,32 +1302,9 @@ fn background_main() {
         MAIN_TID.store(tid, Ordering::Relaxed);
         install_ctrl_handler();
 
-        // 不可见窗口：托盘图标需要一个窗口来接收回调消息
-        let cls = to_wide(BG_CLASS);
-        let mut wc: WNDCLASSW = std::mem::zeroed();
-        wc.lpfn_wnd_proc = Some(bg_wnd_proc);
-        wc.h_instance = 0;
-        wc.h_cursor = 0;
-        wc.h_icon = app_icon();
-        wc.h_brush_background = 16;
-        wc.lpsz_class_name = cls.as_ptr();
-        let _ = RegisterClassW(&wc);
-        let hwnd = CreateWindowExW(
-            0,
-            cls.as_ptr(),
-            cls.as_ptr(),
-            0, // 无 WS_VISIBLE：完全不可见
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            std::ptr::null(),
-        );
-        H_BG.store(hwnd, Ordering::Relaxed);
-        add_tray_icon(hwnd);
+        // 不可见窗口 + 托盘图标：托盘需要一个窗口来接收回调消息
+        ensure_background();
+        let hwnd = H_BG.load(Ordering::Relaxed);
 
         if !start_hook() {
             // 后台没有界面可以提示，记到输出缓冲即可（不会弹窗打扰）
@@ -1511,6 +1472,41 @@ fn remove_tray_icon(h_wnd: HWND) {
     let nid = tray_data(h_wnd, "");
     unsafe {
         let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+    }
+}
+
+/// 确保「后台窗口 + 托盘图标」存在（仅首次创建）。
+/// 普通界面实例在「运行中关闭窗口」时也需要转后台，所以和开机自启共用同一套。
+fn ensure_background() {
+    if H_BG.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    unsafe {
+        let cls = to_wide(BG_CLASS);
+        let mut wc: WNDCLASSW = std::mem::zeroed();
+        wc.lpfn_wnd_proc = Some(bg_wnd_proc);
+        wc.h_instance = 0;
+        wc.h_cursor = 0;
+        wc.h_icon = app_icon();
+        wc.h_brush_background = 16;
+        wc.lpsz_class_name = cls.as_ptr();
+        let _ = RegisterClassW(&wc);
+        let hwnd = CreateWindowExW(
+            0,
+            cls.as_ptr(),
+            cls.as_ptr(),
+            0, // 无 WS_VISIBLE：完全不可见
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        H_BG.store(hwnd, Ordering::Relaxed);
+        add_tray_icon(hwnd);
     }
 }
 
