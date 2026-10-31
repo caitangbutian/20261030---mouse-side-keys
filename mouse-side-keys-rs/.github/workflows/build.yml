@@ -1,0 +1,50 @@
+name: Build mouse-side-keys-rs
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        run: cargo build --release 2>&1 | tee build.log
+
+      - name: Verify exe exists
+        shell: bash
+        run: |
+          if [ ! -f target/release/mouse-side-keys-rs.exe ]; then
+            echo "exe not found"
+            tail -n 40 build.log
+            exit 1
+          fi
+          ls -l target/release/mouse-side-keys-rs.exe
+
+      - name: Publish exe + build log to build-output
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin build-output
+          git checkout -B build-output origin/build-output
+          cp target/release/mouse-side-keys-rs.exe ./mouse-side-keys-rs.exe
+          cp build.log ./build.log
+          git add -f mouse-side-keys-rs.exe build.log
+          if git diff --cached --quiet; then
+            echo "nothing new to publish"
+          else
+            git commit -m "build output $(date -u +%Y%m%dT%H%M%SZ)"
+            git push --force origin build-output
+          fi
