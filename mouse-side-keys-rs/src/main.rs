@@ -12,7 +12,7 @@
 //!   - 全局低级鼠标钩子 WH_MOUSE_LL，回调里只投递消息、真正按键在主循环发
 //!   - 默认按键合成方式 rawsplit：扫描码(wVk=0) + 逐个发送 + 10ms 间隔
 //!     （实测唯一能同时绕开「Win 键按虚拟键码被过滤」和「整批 SendInput 被拒」）
-//!   - 命名互斥体单实例、UIPI 完整性级别检测与弹窗、UAC 提权、后台常驻
+//!   - 启动接管单实例（双击即结束同名旧进程、自己成为唯一实例）、UIPI 完整性级别检测与弹窗、UAC 提权、后台常驻
 //!
 //! 用法：
 //!   mouse_side_keys_rs.exe                 启动（后台常驻，无窗口）
@@ -55,7 +55,7 @@ use windows_sys::Win32::System::Console::{
     AttachConsole, GetConsoleWindow, GetStdHandle, SetConsoleCtrlHandler, WriteConsoleW,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, GetCurrentThreadId, OpenMutexW, OpenProcess,
+    GetCurrentThreadId, OpenProcess,
 };
 
 // 这几个函数在 windows-sys 0.52 里的模块位置和预期不符（OpenProcessToken 不在
@@ -67,6 +67,27 @@ use windows_sys::Win32::System::Threading::{
 // 重要：windows-sys 0.52 的句柄类型（HANDLE / HWND / HHOOK / HMODULE）都是 isize，
 // **不是指针**。所以这里参数与返回值一律用 isize，调用处也不能再传 null_mut()，
 // 判断空句柄要写 `== 0` 而不是 `.is_null()`。
+
+// 进程快照（toolhelp）：用来枚举同名进程，实现「启动接管」单实例。
+const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+const PROCESS_TERMINATE: u32 = 0x0001;
+const MAX_PATH: usize = 260;
+
+#[allow(non_snake_case)]
+#[repr(C)]
+struct PROCESSENTRY32W {
+    dw_size: u32,
+    cnt_usage: u32,
+    th32_process_id: u32,
+    th32_default_heap_id: usize,
+    th32_module_id: u32,
+    cnt_threads: u32,
+    th32_parent_process_id: u32,
+    pc_pri_class_base: i32,
+    dw_flags: u32,
+    sz_exe_file: [u16; MAX_PATH],
+}
+
 unsafe extern "system" {
     fn GetCurrentProcessId() -> u32;
     fn GetModuleHandleW(lpModuleName: *const u16) -> isize;
@@ -74,6 +95,10 @@ unsafe extern "system" {
     fn OpenProcessToken(process: isize, desired_access: u32, token_handle: *mut isize) -> BOOL;
     fn GetSidSubAuthorityCount(pSid: *mut std::ffi::c_void) -> *mut u8;
     fn GetSidSubAuthority(pSid: *mut std::ffi::c_void, nSubAuthority: u32) -> *mut u32;
+    fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> isize;
+    fn Process32FirstW(hSnapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
+    fn Process32NextW(hSnapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
+    fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
 }
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, MapVirtualKeyW, SendInput, INPUT, INPUT_0, KEYBDINPUT,
@@ -121,12 +146,8 @@ const PM_REMOVE: u32 = 0x0001;
 const QS_ALLINPUT: u32 = 0x04FF;
 const MWMO_INPUTAVAILABLE: u32 = 0x0004;
 
-const ERROR_ALREADY_EXISTS: u32 = 183;
-const SYNCHRONIZE: u32 = 0x0010_0000;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const EXTRA_INFO: usize = 0x4D53_4B31; // "MSK1"，给自己的合成事件打标记
-
-const MUTEX_NAME: &str = "Local\\MouseSideKeysDesktopSwitch";
 
 const TOKEN_QUERY: u32 = 0x0008;
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
@@ -246,24 +267,8 @@ fn show_message(title: &str, text: &str, flags: u32) -> i32 {
     unsafe { MessageBoxW(0, w.as_ptr(), cap.as_ptr(), flags) }
 }
 
+// （「已在运行」对话框已移除：单实例改用启动接管，双击即结束同名旧进程、自己成为唯一实例）
 // --------------------------------------------------------------------------
-// 「已在运行」对话框
-//
-// 系统 MessageBoxW 的按钮文字写死成「是 / 否 / 取消」，改不了；要显示
-// 「重新运行 / 立即结束」只能自己建一个 Win32 窗口。纯 user32 + gdi32（仅取字体），
-// 不引入任何 crate 依赖，体积不变。
-//
-// 安全说明：这里**可以**阻塞当前线程 —— 本对话框只在 main() 里、安装
-// WH_MOUSE_LL 钩子**之前**调用，此时阻塞不会冻结鼠标输入。
-// （对比：UIPI 提示框必须走独立线程，因为那时钩子已经装上了。）
-// --------------------------------------------------------------------------
-
-/// 用户对「已在运行」的选择。
-enum RunningChoice {
-    Keep,    // 什么都不做，让现有实例继续跑
-    Restart, // 结束旧实例并重新启动
-    Stop,    // 结束旧实例并且不再启动
-}
 
 const WS_POPUP: u32 = 0x8000_0000;
 const WS_CAPTION: u32 = 0x00C0_0000;
@@ -286,9 +291,6 @@ const DEFAULT_GUI_FONT: i32 = 17;
 
 const ID_RESTART: isize = 1001;
 const ID_STOP: isize = 1002;
-
-/// 对话框结果：0 = 保持，1 = 重新运行，2 = 立即结束。
-static DLG_RESULT: AtomicU32 = AtomicU32::new(0);
 
 #[repr(C)]
 struct WNDCLASSW {
@@ -337,187 +339,6 @@ unsafe extern "system" {
     fn GetStockObject(i: i32) -> HANDLE;
 }
 
-unsafe extern "system" fn ask_dlg_proc(
-    h_wnd: HWND,
-    msg: u32,
-    w_param: WPARAM,
-    l_param: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_COMMAND => {
-            let id = (w_param & 0xFFFF) as isize;
-            if id == ID_RESTART {
-                DLG_RESULT.store(1, Ordering::Relaxed);
-                DestroyWindow(h_wnd);
-            } else if id == ID_STOP {
-                DLG_RESULT.store(2, Ordering::Relaxed);
-                DestroyWindow(h_wnd);
-            }
-            0
-        }
-        WM_CLOSE => {
-            // 关窗 = 保持现状（什么都不做），等价于原来的「否」
-            DestroyWindow(h_wnd);
-            0
-        }
-        WM_DESTROY => {
-            PostQuitMessage(0);
-            0
-        }
-        _ => DefWindowProcW(h_wnd, msg, w_param, l_param),
-    }
-}
-
-/// 模态消息循环：跑到这里阻塞，直到 PostQuitMessage 被调用。
-/// （这两个对话框都在安装钩子之前弹出，所以阻塞不会冻结鼠标。）
-unsafe fn modal_loop() {
-    let mut msg: MSG = std::mem::zeroed();
-    while GetMessageW(&mut msg, 0, 0, 0) > 0 {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
-}
-
-/// 弹出「程序已在运行」对话框，阻塞直到用户做出选择。
-fn ask_running_choice() -> RunningChoice {
-    const W: i32 = 440;
-    const H: i32 = 210;
-
-    unsafe {
-        let class_name = to_wide("MouseSideKeysAskClass");
-        let mut wc: WNDCLASSW = std::mem::zeroed();
-        wc.lpfn_wnd_proc = Some(ask_dlg_proc);
-        wc.h_instance = 0;
-        wc.h_cursor = 0;
-        wc.h_icon = 0;
-        wc.h_brush_background = 16; // COLOR_BTNFACE + 1（系统颜色刷，无需创建 GDI 对象）
-        wc.lpsz_class_name = class_name.as_ptr();
-        // 同一进程重复注册同名类会失败，忽略返回值即可（类已存在照样能用）
-        let _ = RegisterClassW(&wc);
-
-        let title = to_wide("鼠标侧键切换");
-        let body = to_wide("程序已在运行，请确认已开启多窗口！\n（win+tab可查看多窗口）");
-        let hint = to_wide("直接关闭本窗口 = 保持不变，继续运行");
-        let b1_text = to_wide("重新运行");
-        let b2_text = to_wide("立即结束");
-
-        let sx = GetSystemMetrics(SM_CXSCREEN);
-        let sy = GetSystemMetrics(SM_CYSCREEN);
-        let x = if sx > W { (sx - W) / 2 } else { 0 };
-        let y = if sy > H { (sy - H) / 2 } else { 0 };
-
-        let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
-            class_name.as_ptr(),
-            title.as_ptr(),
-            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_DLGFRAME,
-            x,
-            y,
-            W,
-            H,
-            0,
-            0,
-            0,
-            std::ptr::null(),
-        );
-        if hwnd == 0 {
-            // 极少数情况下建窗失败：退回系统消息框，保证功能不丢。
-            let r = show_message(
-                "鼠标侧键切换 —— 已经在运行",
-                "本程序已经在运行了。\n\n\
-                 是(Y) —— 结束旧实例并重新启动\n\
-                 否(N) —— 保持不变，让现在这个实例继续运行\n\
-                 取消   —— 结束旧实例，并且不再启动\n",
-                MB_YESNOCANCEL | MB_ICONQUESTION,
-            );
-            return match r {
-                IDYES => RunningChoice::Restart,
-                IDCANCEL => RunningChoice::Stop,
-                _ => RunningChoice::Keep,
-            };
-        }
-
-        let font = GetStockObject(DEFAULT_GUI_FONT);
-        let static_cls = to_wide("Static");
-        let button_cls = to_wide("Button");
-
-        let h_body = CreateWindowExW(
-            0,
-            static_cls.as_ptr(),
-            body.as_ptr(),
-            WS_CHILD | WS_VISIBLE,
-            24,
-            18,
-            392,
-            54,
-            hwnd,
-            0,
-            0,
-            std::ptr::null(),
-        );
-        SendMessageW(h_body, WM_SETFONT, font as WPARAM, 1);
-
-        let h_hint = CreateWindowExW(
-            0,
-            static_cls.as_ptr(),
-            hint.as_ptr(),
-            WS_CHILD | WS_VISIBLE,
-            24,
-            124,
-            392,
-            20,
-            hwnd,
-            0,
-            0,
-            std::ptr::null(),
-        );
-        SendMessageW(h_hint, WM_SETFONT, font as WPARAM, 1);
-
-        let h_restart = CreateWindowExW(
-            0,
-            button_cls.as_ptr(),
-            b1_text.as_ptr(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            68,
-            80,
-            132,
-            34,
-            hwnd,
-            ID_RESTART,
-            0,
-            std::ptr::null(),
-        );
-        SendMessageW(h_restart, WM_SETFONT, font as WPARAM, 1);
-
-        let h_stop = CreateWindowExW(
-            0,
-            button_cls.as_ptr(),
-            b2_text.as_ptr(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            224,
-            80,
-            132,
-            34,
-            hwnd,
-            ID_STOP,
-            0,
-            std::ptr::null(),
-        );
-        SendMessageW(h_stop, WM_SETFONT, font as WPARAM, 1);
-
-        // 置前并聚焦，避免窗口被别的窗口盖住而用户以为没反应
-        let _ = SetForegroundWindow(hwnd);
-        let _ = SetFocus(h_restart);
-
-        modal_loop();
-    }
-
-    match DLG_RESULT.swap(0, Ordering::Relaxed) {
-        1 => RunningChoice::Restart,
-        2 => RunningChoice::Stop,
-        _ => RunningChoice::Keep,
-    }
-}
 
 /// 命令模式（--stop / --test / --list-presets / --elevate）结束前调用：
 /// 没有控制台时把本次输出汇总弹出来，避免双击运行后什么反馈都看不到。
@@ -570,59 +391,64 @@ fn remove_pid_file() {
 }
 
 // --------------------------------------------------------------------------
-// 单实例：命名互斥体
+// 单实例：启动接管（结束同名旧进程，自己成为唯一实例）
 // --------------------------------------------------------------------------
-fn check_single_instance() -> Option<HANDLE> {
-    let name_w = to_wide(MUTEX_NAME);
+
+/// 把以 0 结尾的 UTF-16 字符串转成 Rust String（如 PROCESSENTRY32W.sz_exe_file）。
+fn wide_to_string(ptr: *const u16) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
     unsafe {
-        let h = CreateMutexW(std::ptr::null(), 0, name_w.as_ptr());
-        if h == 0 {
-            return None;
+        while *ptr.add(len) != 0 {
+            len += 1;
         }
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            let _ = CloseHandle(h);
-            return None;
-        }
-        Some(h) // 句柄有意持有至进程退出：本进程自此成为互斥体持有者
+        String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
     }
 }
 
-fn mutex_exists() -> bool {
-    let name_w = to_wide(MUTEX_NAME);
-    unsafe {
-        let h = OpenMutexW(SYNCHRONIZE, 0, name_w.as_ptr());
-        if h != 0 {
-            let _ = CloseHandle(h);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-fn takeover_old_instance() {
-    let path = pid_file_path();
-    if !std::path::Path::new(&path).exists() {
+/// 启动接管：枚举所有同名进程，结束除自己以外的实例，确保本进程成为唯一实例。
+///
+/// 取代原先的「消息锚点窗口」方案：不再保留任何隐藏窗口，双击 exe 永远是
+/// 「杀掉旧进程 → 自己成为唯一实例 → 显示全新界面」。后台静默实例也一并被接管，
+/// 因此开机自启后再想配置，直接双击即可（旧的后台实例会被结束，钩子短暂卸载后
+/// 由新界面重新接管）。
+fn take_over_instance() {
+    let self_pid = unsafe { GetCurrentProcessId() };
+    let my_name = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .unwrap_or_default();
+    if my_name.is_empty() {
         return;
     }
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let pid: u32 = content.trim().parse().unwrap_or(0);
-    if pid != 0 {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/PID", &pid.to_string()])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status();
-    }
-    // taskkill /F 返回不代表目标进程已完全销毁，互斥体释放是异步的。
-    // 固定 sleep 在系统繁忙时不够，必须轮询等互斥体真正释放，否则新实例
-    // 会误判「仍有实例在运行」而退出 —— 新旧两空。
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if !mutex_exists() {
-            break;
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return;
         }
-        sleep_ms(100);
+        let mut pe: PROCESSENTRY32W = std::mem::zeroed();
+        pe.dw_size = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut pe) != 0 {
+            loop {
+                let pname = wide_to_string(pe.sz_exe_file.as_ptr());
+                if pname.eq_ignore_ascii_case(&my_name) && pe.th32_process_id != self_pid {
+                    let h = OpenProcess(PROCESS_TERMINATE, 0, pe.th32_process_id);
+                    if h != 0 {
+                        let _ = TerminateProcess(h, 0);
+                        let _ = CloseHandle(h);
+                    }
+                }
+                if Process32NextW(snap, &mut pe) == 0 {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
     }
+    // 给被终止进程一点时间卸载钩子 / 销毁窗口，避免新实例瞬间与之冲突。
+    sleep_ms(300);
 }
 
 fn cmd_stop() {
@@ -988,12 +814,10 @@ static HOOK: AtomicIsize = AtomicIsize::new(0);
 static H_STATUS: AtomicIsize = AtomicIsize::new(0);
 static H_TOGGLE: AtomicIsize = AtomicIsize::new(0);
 static H_AUTOSTART: AtomicIsize = AtomicIsize::new(0);
-/// 主界面窗口句柄（后台/无界面时为 0，直到被重新打开）
+/// 主界面窗口句柄（后台/无界面时为 0）
 static H_MAIN: AtomicIsize = AtomicIsize::new(0);
 
 unsafe extern "system" {
-    fn FindWindowW(lp_class_name: *const u16, lp_window_name: *const u16) -> HWND;
-    fn ShowWindow(h_wnd: HWND, n_cmd_show: i32) -> BOOL;
     fn SetWindowTextW(h_wnd: HWND, lp_string: *const u16) -> BOOL;
 }
 
@@ -1027,22 +851,7 @@ fn stop_hook() {
     remove_pid_file();
 }
 
-/// 已经有一个实例在跑时，把它的界面叫到前台（或重新打开）。返回是否找到了那个实例。
-///
-/// 任何形态（界面开着 / 关闭后后台运行 / 开机自启无界面）都共用同一个消息专用
-/// 「锚点窗口」：找到它并发送 WM_APP_SHOW_MAIN，由**已经在跑的那个进程**把主界面
-/// 显示出来。这样双击 exe 永远只是「唤出界面」，不会二选一或开第二个。
-fn activate_existing_window() -> bool {
-    let cls = to_wide(ANCHOR_CLASS);
-    unsafe {
-        let h = FindWindowW(cls.as_ptr(), std::ptr::null());
-        if h != 0 {
-            let _ = SendMessageW(h, WM_APP_SHOW_MAIN, 0, 0);
-            return true;
-        }
-    }
-    false
-}
+// （已移除 activate_existing_window：单实例改用启动接管，双击即结束旧进程，无需唤出旧界面）
 
 /// 把「状态」文字和「启动 / 停止」按钮文字同步成当前真实状态。
 /// 界面还没建起来（后台模式）时静默跳过。
@@ -1110,7 +919,7 @@ unsafe extern "system" fn main_wnd_proc(
             H_MAIN.store(0, Ordering::Relaxed);
             if hook_running() {
                 // 运行中关闭窗口 → 直接销毁窗口，钩子继续在后台跑（无窗口、无托盘），
-                // 程序保持存活。需要再次操作时双击 exe 即可重新唤出界面。
+                // 程序保持存活。需要再次操作时双击 exe 即可：新进程会结束本进程并弹出全新界面。
                 0
             } else {
                 // 已停止关闭窗口 → 退出整个程序
@@ -1259,7 +1068,6 @@ fn ui_main() {
         let tid = GetCurrentThreadId();
         MAIN_TID.store(tid, Ordering::Relaxed);
         install_ctrl_handler();
-        ensure_anchor();
 
         if create_main_window() == 0 {
             show_message(
@@ -1276,14 +1084,13 @@ fn ui_main() {
 
 /// 后台静默模式（--background，开机自启时走这里）：
 /// 不创建任何可见窗口、也不放托盘图标，直接装好钩子让侧键生效。
-/// 仅保留一个不可见的「锚点窗口」用于单实例重新打开界面。
-/// 需要操作时双击 exe 即可唤出界面（启动 / 停止 / 退出）。
+/// 需要操作时双击 exe 即可：新进程会结束旧的后台实例并弹出全新界面
+/// （启动 / 停止 / 退出），因此无需保留任何隐藏窗口。
 fn background_main() {
     unsafe {
         let tid = GetCurrentThreadId();
         MAIN_TID.store(tid, Ordering::Relaxed);
         install_ctrl_handler();
-        ensure_anchor();
 
         if !start_hook() {
             // 后台没有界面可以提示，记到输出缓冲即可（不会弹窗打扰）
@@ -1314,14 +1121,7 @@ fn message_loop() {
     }
 }
 
-// --------------------------------------------------------------------------
-// 锚点窗口 —— 单实例重新打开界面的消息入口（无界面、无托盘）
-// --------------------------------------------------------------------------
-
-// 消息专用锚点窗口：不可见、不进任务栏、无托盘，仅用于单实例重新打开界面。
-const ANCHOR_CLASS: &str = "MouseSideKeysAnchor";
-const HWND_MESSAGE: isize = -3; // 消息专用窗口的父句柄（HWND_MESSAGE）
-const WM_APP_SHOW_MAIN: u32 = 0x8003; // WM_APP + 3：让后台实例把主界面打开
+// 系统默认应用图标（加载内置图标失败时回退用）。
 const IDI_APPLICATION: usize = 32512;
 
 unsafe extern "system" {
@@ -1341,84 +1141,7 @@ fn app_icon() -> HANDLE {
     }
 }
 
-/// 锚点窗口句柄（消息专用、不可见、无托盘）。
-static H_ANCHOR: AtomicIsize = AtomicIsize::new(0);
-
-/// 确保「锚点窗口」存在（仅首次创建）。
-/// 锚点是一个消息专用窗口（父为 HWND_MESSAGE），完全不可见、不进任务栏、无托盘，
-/// 仅用于：① 单实例的第二个 exe 通过 FindWindowW 找到正在运行的实例；
-/// ② 接收 WM_APP_SHOW_MAIN 把主界面重新打开。
-/// 这样「关闭窗口但保留后台功能」时程序仍能存活并被重新唤出，且没有任何可见残留。
-fn ensure_anchor() {
-    if H_ANCHOR.load(Ordering::Relaxed) != 0 {
-        return;
-    }
-    unsafe {
-        let cls = to_wide(ANCHOR_CLASS);
-        let mut wc: WNDCLASSW = std::mem::zeroed();
-        wc.lpfn_wnd_proc = Some(anchor_wnd_proc);
-        wc.h_instance = 0;
-        wc.h_cursor = 0;
-        wc.h_icon = 0;
-        wc.h_brush_background = 16;
-        wc.lpsz_class_name = cls.as_ptr();
-        let _ = RegisterClassW(&wc);
-        let hwnd = CreateWindowExW(
-            0,
-            cls.as_ptr(),
-            cls.as_ptr(),
-            0,
-            0,
-            0,
-            0,
-            0,
-            HWND_MESSAGE,
-            0,
-            0,
-            std::ptr::null(),
-        );
-        H_ANCHOR.store(hwnd, Ordering::Relaxed);
-    }
-}
-
-unsafe extern "system" fn anchor_wnd_proc(
-    h_wnd: HWND,
-    msg: u32,
-    _w_param: WPARAM,
-    _l_param: LPARAM,
-) -> LRESULT {
-    if msg == WM_APP_SHOW_MAIN {
-        // 第二个实例请求打开界面：已有的（或新建的）主界面会显示到前台
-        open_main_window();
-        return 0;
-    }
-    match msg {
-        WM_DESTROY => {
-            PostQuitMessage(0);
-            0
-        }
-        _ => DefWindowProcW(h_wnd, msg, _w_param, _l_param),
-    }
-}
-
-/// 把主界面叫出来（已打开则置前，没打开则新建）。
-fn open_main_window() {
-    unsafe {
-        let h = H_MAIN.load(Ordering::Relaxed);
-        if h != 0 {
-            let _ = ShowWindow(h, SW_RESTORE);
-            let _ = SetForegroundWindow(h);
-            refresh_ui();
-            return;
-        }
-        let h = create_main_window();
-        if h != 0 {
-            let _ = ShowWindow(h, SW_RESTORE);
-            let _ = SetForegroundWindow(h);
-            refresh_ui();
-        }
-    }
-}
+// （已移除锚点窗口与 open_main_window：单实例改用启动接管，无需隐藏窗口重新打开界面）
 
 // --------------------------------------------------------------------------
 // 提权重启（--elevate）
@@ -1753,7 +1476,7 @@ fn main() {
     CONFIG.get_or_init(|| cfg);
 
     // --background：后台静默模式。由开机启动的计划任务传入，
-    // 不显示任何界面、也不放托盘图标，直接让侧键生效（锚点窗口仅用于重新打开界面）。
+    // 不显示任何界面、也不放托盘图标，直接让侧键生效。双击 exe 会结束本实例并弹出界面。
     let background = std::env::args().any(|a| a == "--background");
     BACKGROUND.store(background, Ordering::Relaxed);
 
@@ -1809,66 +1532,16 @@ fn main() {
         return;
     }
 
+    // 启动接管：无论后台还是界面模式，先把同名旧进程结束掉，自己成为唯一实例。
+    // 这样双击 exe 永远是「杀掉旧进程 → 全新界面」，不需要任何隐藏窗口来重新打开界面。
+    take_over_instance();
+
     if background {
-        // 后台模式：已经有一个在跑就直接退出，绝不弹窗打扰（开机登录时尤其重要）。
-        let _mutex = match check_single_instance() {
-            Some(h) => h,
-            None => {
-                out("已有实例在运行，后台模式直接退出。\n");
-                return;
-            }
-        };
         let level = describe_level(integrity_level(None).unwrap_or(0));
         out(&format!("后台静默启动，权限级别：{}\n", level));
         background_main();
         return;
     }
-
-    // 单实例：已经有一个在跑的话，把它的界面叫到前台，而不是再开一个。
-    let _mutex = if mutex_exists() {
-        if activate_existing_window() {
-            return;
-        }
-        // 找不到窗口：可能是旧的无界面实例，让用户决定怎么处理
-        match ask_running_choice() {
-            RunningChoice::Keep => return,
-            RunningChoice::Stop => {
-                takeover_old_instance();
-                remove_pid_file();
-                return;
-            }
-            RunningChoice::Restart => {
-                takeover_old_instance();
-                match check_single_instance() {
-                    Some(h) => h,
-                    None => {
-                        show_message(
-                            "鼠标侧键切换",
-                            "结束旧实例失败，或旧实例还没有完全退出。\n\
-                             请稍候再试，或用任务管理器结束后重试。",
-                            MB_ICONWARNING | MB_SETFOREGROUND,
-                        );
-                        return;
-                    }
-                }
-            }
-        }
-    } else {
-        // 没有其它实例：仍然清理上一版残留（--stop 没跑干净 / 旧版进程），
-        // 避免「改了代码却还在跑旧版」。
-        takeover_old_instance();
-        match check_single_instance() {
-            Some(h) => h,
-            None => {
-                show_message(
-                    "鼠标侧键切换",
-                    "启动失败：无法创建单实例互斥体。",
-                    MB_ICONWARNING | MB_SETFOREGROUND,
-                );
-                return;
-            }
-        }
-    };
 
     let level = describe_level(integrity_level(None).unwrap_or(0));
     out(&format!("本进程权限级别：{}\n", level));
@@ -1879,5 +1552,4 @@ fn main() {
 
     // 显示主界面。核心功能默认不启动，由用户在界面上点「启动」。
     ui_main();
-    // _mutex 在此离开作用域；我们不主动 CloseHandle，让它随进程退出释放。
 }
