@@ -1,0 +1,131 @@
+[1m[92m    Updating[0m crates.io index
+[1m[92m     Locking[0m 27 packages to highest compatible versions
+[1m[92m      Adding[0m windows-sys v0.52.0 [1m[93m(available: v0.61.2)[0m
+[1m[92m Downloading[0m crates ...
+[1m[92m  Downloaded[0m indexmap v2.14.2
+[1m[92m  Downloaded[0m equivalent v1.0.3
+[1m[92m  Downloaded[0m serde_spanned v1.1.2
+[1m[92m  Downloaded[0m toml_writer v1.2.0+spec-1.1.0
+[1m[92m  Downloaded[0m version_check v0.9.5
+[1m[92m  Downloaded[0m toml_datetime v1.1.2+spec-1.1.0
+[1m[92m  Downloaded[0m toml_parser v1.1.5+spec-1.1.0
+[1m[92m  Downloaded[0m toml v1.2.0+spec-1.1.0
+[1m[92m  Downloaded[0m serde_core v1.0.229
+[1m[92m  Downloaded[0m winresource v0.1.34
+[1m[92m  Downloaded[0m hashbrown v0.17.1
+[1m[92m  Downloaded[0m winnow v1.0.5
+[1m[92m   Compiling[0m serde_core v1.0.229
+[1m[92m   Compiling[0m winnow v1.0.5
+[1m[92m   Compiling[0m version_check v0.9.5
+[1m[92m   Compiling[0m toml_parser v1.1.5+spec-1.1.0
+[1m[92m   Compiling[0m serde_spanned v1.1.2
+[1m[92m   Compiling[0m toml_datetime v1.1.2+spec-1.1.0
+[1m[92m   Compiling[0m toml v1.2.0+spec-1.1.0
+[1m[92m   Compiling[0m winresource v0.1.34
+[1m[92m   Compiling[0m mouse-side-keys-rs v0.1.0 (D:\a\20261030---mouse-side-keys\20261030---mouse-side-keys\mouse-side-keys-rs)
+[1m[93mwarning[0m[1m[97m: unused imports: `HHOOK`, `HOOKPROC`, `MsgWaitForMultipleObjectsEx`, and `PeekMessageW`[0m
+   [1m[96m--> [0msrc\main.rs:109:5
+    [1m[96m|[0m
+[1m[96m109[0m [1m[96m|[0m     MsgWaitForMultipleObjectsEx, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
+    [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m  [1m[93m^^^^^^^^^^^^[0m
+[1m[96m110[0m [1m[96m|[0m     TranslateMessage, HHOOK, HOOKPROC, MSLLHOOKSTRUCT, MSG, WH_MOUSE_LL,
+    [1m[96m|[0m                       [1m[93m^^^^^[0m  [1m[93m^^^^^^^^[0m
+    [1m[96m|[0m
+    [1m[96m= [0m[1m[97mnote[0m: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: constant `PM_REMOVE` is never used[0m
+   [1m[96m--> [0msrc\main.rs:145:7
+    [1m[96m|[0m
+[1m[96m145[0m [1m[96m|[0m const PM_REMOVE: u32 = 0x0001;
+    [1m[96m|[0m       [1m[93m^^^^^^^^^[0m
+    [1m[96m|[0m
+    [1m[96m= [0m[1m[97mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: constant `QS_ALLINPUT` is never used[0m
+   [1m[96m--> [0msrc\main.rs:146:7
+    [1m[96m|[0m
+[1m[96m146[0m [1m[96m|[0m const QS_ALLINPUT: u32 = 0x04FF;
+    [1m[96m|[0m       [1m[93m^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: constant `MWMO_INPUTAVAILABLE` is never used[0m
+   [1m[96m--> [0msrc\main.rs:147:7
+    [1m[96m|[0m
+[1m[96m147[0m [1m[96m|[0m const MWMO_INPUTAVAILABLE: u32 = 0x0004;
+    [1m[96m|[0m       [1m[93m^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: constant `MB_YESNOCANCEL` is never used[0m
+   [1m[96m--> [0msrc\main.rs:162:7
+    [1m[96m|[0m
+[1m[96m162[0m [1m[96m|[0m const MB_YESNOCANCEL: u32 = 0x0000_0003;
+    [1m[96m|[0m       [1m[93m^^^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: constant `MB_ICONQUESTION` is never used[0m
+   [1m[96m--> [0msrc\main.rs:163:7
+    [1m[96m|[0m
+[1m[96m163[0m [1m[96m|[0m const MB_ICONQUESTION: u32 = 0x0000_0020;
+    [1m[96m|[0m       [1m[93m^^^^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: constant `IDCANCEL` is never used[0m
+   [1m[96m--> [0msrc\main.rs:168:7
+    [1m[96m|[0m
+[1m[96m168[0m [1m[96m|[0m const IDCANCEL: i32 = 2;
+    [1m[96m|[0m       [1m[93m^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: constant `BS_DEFPUSHBUTTON` is never used[0m
+   [1m[96m--> [0msrc\main.rs:280:7
+    [1m[96m|[0m
+[1m[96m280[0m [1m[96m|[0m const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
+    [1m[96m|[0m       [1m[93m^^^^^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: constant `WS_EX_TOPMOST` is never used[0m
+   [1m[96m--> [0msrc\main.rs:281:7
+    [1m[96m|[0m
+[1m[96m281[0m [1m[96m|[0m const WS_EX_TOPMOST: u32 = 0x0000_0008;
+    [1m[96m|[0m       [1m[93m^^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: constant `ID_RESTART` is never used[0m
+   [1m[96m--> [0msrc\main.rs:292:7
+    [1m[96m|[0m
+[1m[96m292[0m [1m[96m|[0m const ID_RESTART: isize = 1001;
+    [1m[96m|[0m       [1m[93m^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: constant `ID_STOP` is never used[0m
+   [1m[96m--> [0msrc\main.rs:293:7
+    [1m[96m|[0m
+[1m[96m293[0m [1m[96m|[0m const ID_STOP: isize = 1002;
+    [1m[96m|[0m       [1m[93m^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: constant `SW_RESTORE` is never used[0m
+   [1m[96m--> [0msrc\main.rs:811:7
+    [1m[96m|[0m
+[1m[96m811[0m [1m[96m|[0m const SW_RESTORE: i32 = 9;
+    [1m[96m|[0m       [1m[93m^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: function `SetForegroundWindow` is never used[0m
+   [1m[96m--> [0msrc\main.rs:331:8
+    [1m[96m|[0m
+[1m[96m331[0m [1m[96m|[0m     fn SetForegroundWindow(h_wnd: HWND) -> BOOL;
+    [1m[96m|[0m        [1m[93m^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: structure field `Sid` should have a snake case name[0m
+   [1m[96m--> [0msrc\main.rs:177:5
+    [1m[96m|[0m
+[1m[96m177[0m [1m[96m|[0m     Sid: *mut std::ffi::c_void,
+    [1m[96m|[0m     [1m[93m^^^[0m [1m[93mhelp: convert the identifier to snake case (notice the capitalization): `sid`[0m
+    [1m[96m|[0m
+    [1m[96m= [0m[1m[97mnote[0m: `#[warn(non_snake_case)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: structure field `Attributes` should have a snake case name[0m
+   [1m[96m--> [0msrc\main.rs:178:5
+    [1m[96m|[0m
+[1m[96m178[0m [1m[96m|[0m     Attributes: u32,
+    [1m[96m|[0m     [1m[93m^^^^^^^^^^[0m [1m[93mhelp: convert the identifier to snake case: `attributes`[0m
+
+[1m[93mwarning[0m[1m[97m: structure field `Label` should have a snake case name[0m
+   [1m[96m--> [0msrc\main.rs:182:5
+    [1m[96m|[0m
+[1m[96m182[0m [1m[96m|[0m     Label: SID_AND_ATTRIBUTES,
+    [1m[96m|[0m     [1m[93m^^^^^[0m [1m[93mhelp: convert the identifier to snake case: `label`[0m
+
+[1m[93mwarning[0m: `mouse-side-keys-rs` (bin "mouse-side-keys-rs") generated 16 warnings (run `cargo fix --bin "mouse-side-keys-rs" -p mouse-side-keys-rs` to apply 1 suggestion)
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 20.53s
